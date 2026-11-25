@@ -54,7 +54,7 @@ def ensure_ez_tools():
 
         still_missing = find_missing_tools()
         if not still_missing:
-            console.print("[green][+] EZ Tools loaded into session PATH.[/green]\n")
+            console.print("[green][+] EZ Tools loaded into session PATH.[/green]\n[red][!] Note: This change is temporary and will not persist after this session. To make it permanent, add the EZ Tools directory to your Windows PATH.[/red]\n")
             return True
 
         console.print("[red][!] Still missing: " + ", ".join(still_missing.values()) + "[/red]")
