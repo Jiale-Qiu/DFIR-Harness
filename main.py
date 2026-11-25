@@ -1,7 +1,6 @@
 import argparse
 from pathlib import Path
-from modules import scanner
-from rich import print
+from modules import scanner, preflight
 from rich.console import Console
 import time
 
@@ -14,7 +13,6 @@ def getValidDirectory(cli_path=None):
         if not raw_path:
             raw_path = input("Enter the full path of your investigation directory: ")
 
-        # Strip accidental quotes
         cleaned = raw_path.strip().strip('"').strip("'")
         target = Path(cleaned)
 
@@ -22,28 +20,29 @@ def getValidDirectory(cli_path=None):
             return target
 
         console.print(f"[red][!] Error: '{cleaned}' is not a valid directory. Try again.\n")
-        raw_path = None  # Reset so the loop prompts the user
+        raw_path = None
 
 def main():
-    console.print("cleb's DFIR harness v1.0")
+    console.print("\ncleb's DFIR harness v1.0\n")
 
     parser = argparse.ArgumentParser(description="AI-Assisted Windows DFIR Harness")
     parser.add_argument("directory", nargs="?", help="Path to the investigation directory")
+    parser.add_argument("--dry-run", action="store_true", help="Skip tool checks and simulate execution")
     args = parser.parse_args()
 
-    time.sleep(0.1)
+    if not args.dry_run:
+        if not preflight.ensure_ez_tools():
+            return
 
     main_directory = getValidDirectory(args.directory)
     console.print(f"Main directory set to: {main_directory}\n")
 
-    console.print("Analyzing main directory...")
+    console.print("Analyzing main directory...\n")
     files = scanner.scanDirectory(main_directory)
-
-    time.sleep(0.1)
 
     for category, items in files.items():
         console.print(f"{category.upper()}: {len(items)} files")
-        time.sleep(0.1)
+        time.sleep(0.05)
 
 if __name__ == "__main__":
     main()
