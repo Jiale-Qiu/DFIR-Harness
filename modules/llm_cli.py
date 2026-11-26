@@ -5,7 +5,7 @@ from rich.console import Console
 console = Console(highlight=False)
 
 MODEL = "moonshotai/kimi-k3.1-pro"
-BASE_URL = "https://integrate.api.nvidia.com/v1"
+BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
 def start_cli(con, mounted_views: set[str], base_output):
