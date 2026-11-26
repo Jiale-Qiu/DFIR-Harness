@@ -59,28 +59,7 @@ HUNTS = [
             ORDER BY Hits DESC
             LIMIT 20
         """,
-    },
-    {
-        "title": "MFT Executables & Scripts in User/Temp Paths",
-        "requires": ["mft"],
-        "sql": """
-            SELECT
-                Created0x10 AS Created,
-                FileName,
-                ParentPath,
-                FileSize,
-                InUse
-            FROM mft
-            WHERE LOWER(Extension) IN ('.exe', '.dll', '.ps1', '.bat', '.vbs', '.hta', '.zip', '.7z', '.rar')
-              AND (
-                  ParentPath ILIKE '%Users%'
-                  OR ParentPath ILIKE '%Temp%'
-                  OR ParentPath ILIKE '%ProgramData%'
-              )
-            ORDER BY Created0x10 DESC
-            LIMIT 25
-        """,
-    },
+    }
 ]
 
 
