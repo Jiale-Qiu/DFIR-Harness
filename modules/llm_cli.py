@@ -85,7 +85,7 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
         "   - Compare IDs as strings (e.g., `EventId = '4624'`).\n"
         "   - Use `TRY_CAST(col AS BIGINT)` for numeric sorting/filtering.\n"
         "   - Use `ILIKE` for case-insensitive Windows path/filename matching.\n"
-        "2. Always include `LIMIT 25` or `LIMIT 50` on non-aggregated queries.\n"
+        "2. Always include `LIMIT 50` or `LIMIT 100` on non-aggregated queries (output caps at 100 rows).\n"
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
         "5. If the analyst declines a tool action, respect the decision and ask how they want to proceed."

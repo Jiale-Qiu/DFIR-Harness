@@ -2,7 +2,7 @@ import re
 import duckdb
 from modules.llm_ui import confirm_sql, console, print_result_table
 
-MAX_RESULT_ROWS = 50
+MAX_RESULT_ROWS = 100
 _LEADING_COMMENTS_RE = re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*", re.DOTALL)
 READ_ONLY_KEYWORDS = {"SELECT", "WITH", "DESCRIBE", "SHOW", "SUMMARIZE", "EXPLAIN"}
 

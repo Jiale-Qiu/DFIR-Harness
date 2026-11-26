@@ -2,6 +2,7 @@ import threading
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
@@ -12,7 +13,7 @@ console = Console(highlight=False)
 
 
 class StreamRenderer:
-    """Thread-safe incremental Live renderer with auto-collapsing thinking stream."""
+    """Thread-safe incremental Live renderer with Markdown formatting and auto-collapsing thinking."""
 
     def __init__(self, reasoning_level: str, thinking_mode: str):
         self.reasoning_level = reasoning_level
@@ -23,9 +24,9 @@ class StreamRenderer:
         self._pending_thinking: list[str] = []
         self._pending_answer: list[str] = []
         self._thinking_text = Text(style="dim italic")
-        self._answer_text = Text()
+        self._answer_chunks: list[str] = []
+        self._answer_md: Markdown | None = None
         self._thinking_chars = 0
-        self._has_answer = False
 
     def add_thinking(self, token: str):
         with self._lock:
@@ -56,15 +57,16 @@ class StreamRenderer:
                     self._thinking_chars += len(chunk)
 
             if self._pending_answer:
-                chunk = "".join(self._pending_answer)
+                self._answer_chunks.extend(self._pending_answer)
                 self._pending_answer.clear()
-                self._answer_text.append(chunk)
-                self._has_answer = True
+                raw_md = "".join(self._answer_chunks).lstrip("\n")
+                if raw_md.strip():
+                    self._answer_md = Markdown(raw_md, code_theme="monokai")
 
             spinner = self.spinner
             status_note = self.status_note
             thinking_chars = self._thinking_chars
-            has_answer = self._has_answer
+            answer_md = self._answer_md
 
         prefix = Text.assemble(("AI ", "bold green"), (f"[{self.reasoning_level}]", "cyan"))
 
@@ -72,13 +74,13 @@ class StreamRenderer:
             header_items = [prefix, spinner, Text(">", style="bold green")]
             if status_note:
                 header_items.append(Text(status_note, style="dim cyan"))
-            elif thinking_chars == 0 and not has_answer:
+            elif thinking_chars == 0 and answer_md is None:
                 header_items.append(Text("Thinking...", style="dim"))
             header = Columns(header_items, padding=(0, 1))
         else:
             header = Text.assemble(prefix, (" >", "bold green"))
 
-        if thinking_chars == 0 and not has_answer:
+        if thinking_chars == 0 and answer_md is None:
             return header
 
         parts = [header]
@@ -93,11 +95,11 @@ class StreamRenderer:
             else:
                 parts.append(Text("[Thinking]", style="dim bold"))
                 parts.append(self._thinking_text)
-            if has_answer:
+            if answer_md is not None:
                 parts.append(Text(""))
 
-        if has_answer:
-            parts.append(self._answer_text)
+        if answer_md is not None:
+            parts.append(answer_md)
 
         return Group(*parts)
 
@@ -125,7 +127,7 @@ def print_help():
     console.print(table)
 
 
-def print_result_table(entry: dict, max_rows: int = 50):
+def print_result_table(entry: dict, max_rows: int = 100):
     """Renders a cached query result entry as a Rich Table."""
     rows = entry["rows"]
     columns = entry["columns"]

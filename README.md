@@ -4,6 +4,19 @@
 
 Still a work in progress
 
+Necessary Environment Variables:
+```
+# NVIDIA NIM (paste the exact model ID shown on the NIM page)
+$env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
+$env:OPENAI_API_KEY="nvapi-your-key-here"
+$env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
+
+# Or switch to Groq in the same terminal
+$env:OPENAI_BASE_URL="https://api.groq.com/openai/v1"
+$env:OPENAI_API_KEY="gsk_your-key-here"
+$env:LLM_MODEL="llama-3.3-70b-versatile"
+```
+
 Template Tool:
 ```python
 def _my_handler(args: dict, ctx: dict) -> dict:
@@ -27,4 +40,3 @@ REGISTER = [
         "handler": _my_handler,
     }
 ]
-```
