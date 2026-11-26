@@ -1,11 +1,11 @@
 """
 # NVIDIA NIM
-$env:OPENAI_BASE_URL="[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)"
+$env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
 $env:OPENAI_API_KEY="nvapi-your-key-here"
 $env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
 
 # Or switch to Groq in the same terminal
-$env:OPENAI_BASE_URL="[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)"
+$env:OPENAI_BASE_URL="https://api.groq.com/openai/v1"
 $env:OPENAI_API_KEY="gsk_your-key-here"
 $env:LLM_MODEL="llama-3.3-70b-versatile"
 """
@@ -36,6 +36,7 @@ DEFAULT_REASONING = "medium"
 DEFAULT_THINKING_MODE = "collapse"
 MAX_TOOL_ROUNDS = 6
 MAX_TRIAGE_CHARS = 6000
+MAX_TOKENS = 8192
 
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
@@ -111,27 +112,30 @@ def _stream_completion(
     messages: list[dict],
     state: dict,
     allow_tools: bool = True,
+    reasoning_override: str | None = None,
 ):
-    """Streams one LLM turn, returning (reply_text, tool_calls_list, finish_reason)."""
+    """Streams one LLM turn, returning (reply_text, reasoning_text, tool_calls_list, finish_reason)."""
+    effective_reasoning = reasoning_override if reasoning_override is not None else state["reasoning"]
     request_kwargs = {
         "model": model,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 4096,
+        "max_tokens": MAX_TOKENS,
         "stream": True,
     }
     if TOOL_SCHEMAS:
         request_kwargs["tools"] = TOOL_SCHEMAS
         request_kwargs["tool_choice"] = "auto" if allow_tools else "none"
-    if state["reasoning"] != "off":
-        request_kwargs["extra_body"] = {"reasoning_effort": state["reasoning"]}
+    if effective_reasoning != "off":
+        request_kwargs["extra_body"] = {"reasoning_effort": effective_reasoning}
 
     answer_chunks: list[str] = []
+    reasoning_chunks: list[str] = []
     tool_calls_acc: dict[int, dict] = {}
     finish_reason = None
 
     console.print()
-    with StreamRenderer(state["reasoning"], state["thinking_mode"]) as renderer:
+    with StreamRenderer(effective_reasoning, state["thinking_mode"]) as renderer:
         stream = client.chat.completions.create(**request_kwargs)
         for chunk in stream:
             if not chunk.choices:
@@ -144,6 +148,7 @@ def _stream_completion(
             delta = choice.delta
             reasoning_token = getattr(delta, "reasoning_content", None)
             if reasoning_token:
+                reasoning_chunks.append(reasoning_token)
                 renderer.add_thinking(reasoning_token)
 
             if delta.content:
@@ -167,7 +172,7 @@ def _stream_completion(
 
     print()
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-    return "".join(answer_chunks), tool_calls, finish_reason
+    return "".join(answer_chunks), "".join(reasoning_chunks), tool_calls, finish_reason
 
 
 def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: list[dict]) -> bool:
@@ -329,23 +334,61 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
             messages.append({"role": "user", "content": user_input})
 
             try:
-                for round_idx in range(MAX_TOOL_ROUNDS):
-                    # Reserve the final round for synthesis so the turn never ends without a summary
-                    allow_tools = round_idx < (MAX_TOOL_ROUNDS - 1)
-                    reply, tool_calls, finish_reason = _stream_completion(
-                        client, model, messages, ctx["state"], allow_tools=allow_tools
+                empty_retries = 0
+                round_idx = 0
+                while round_idx < MAX_TOOL_ROUNDS:
+                    # Reserve the final round (and empty-reply retries) for synthesis
+                    allow_tools = (round_idx < (MAX_TOOL_ROUNDS - 1)) and (empty_retries == 0)
+                    retry_reasoning = (
+                        "low" if (empty_retries > 0 and ctx["state"]["reasoning"] != "off") else None
+                    )
+                    reply, reasoning, tool_calls, finish_reason = _stream_completion(
+                        client,
+                        model,
+                        messages,
+                        ctx["state"],
+                        allow_tools=allow_tools,
+                        reasoning_override=retry_reasoning,
                     )
 
                     if finish_reason == "length":
-                        console.print("[yellow][!] Response hit max_tokens (4096) and was cut short.[/yellow]\n")
+                        console.print(f"[yellow][!] Response hit max_tokens ({MAX_TOKENS}) and was cut short.[/yellow]\n")
 
                     if not tool_calls:
-                        if reply:
+                        if reply.strip():
                             messages.append({"role": "assistant", "content": reply})
+                            break
+
+                        if empty_retries < 1:
+                            empty_retries += 1
+                            console.print(
+                                f"[yellow][*] Model returned no final answer "
+                                f"(finish_reason={finish_reason or 'unknown'}) — retrying synthesis...[/yellow]"
+                            )
+                            continue
+
+                        console.print(
+                            f"[yellow][!] Model still returned no final answer "
+                            f"(finish_reason={finish_reason or 'unknown'}).[/yellow]"
+                        )
+                        if reasoning.strip() and ctx["state"]["thinking_mode"] != "full":
+                            console.print("[dim]--- Captured reasoning (no final reply emitted) ---[/dim]")
+                            console.print(reasoning.strip(), style="dim")
+                        print()
+
+                        if round_idx > 0:
+                            # Keep executed tool results in context with a valid assistant turn
+                            messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": reasoning.strip() or "[No final summary returned]",
+                                }
+                            )
                         else:
                             del messages[turn_start_idx:]
                         break
 
+                    empty_retries = 0
                     messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
 
                     for tc in tool_calls:
@@ -360,6 +403,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
                                 "content": json.dumps(result, ensure_ascii=False),
                             }
                         )
+                    round_idx += 1
                 else:
                     console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
 

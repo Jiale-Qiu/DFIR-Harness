@@ -8,11 +8,16 @@ import sys
 import time
 from pathlib import Path
 
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
-MAX_CELL_CHARS = 160
+MAX_TABLE_CELL_CHARS = 160
+MAX_CARD_CELL_CHARS = 500
+MIN_TABLE_COL_WIDTH = 14
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -54,8 +59,8 @@ def pid_is_alive(pid: int) -> bool:
         return True
 
 
-def _truncate(val: object, limit: int = MAX_CELL_CHARS) -> str:
-    text = "" if val is None else str(val)
+def _truncate(val: object, limit: int) -> str:
+    text = "" if val is None else str(val).replace("\r\n", " ").replace("\n", " ")
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -71,6 +76,63 @@ def _render_waiting(console: Console) -> None:
     )
 
 
+def _filter_empty_columns(columns: list[str], rows: list[list]) -> tuple[list[str], list[list], list[str]]:
+    """Drops columns that are empty across every row so wide EVTX queries stay compact."""
+    keep_idx = []
+    hidden = []
+    for i, col in enumerate(columns):
+        has_val = any(i < len(r) and r[i] is not None and str(r[i]).strip() != "" for r in rows)
+        if has_val:
+            keep_idx.append(i)
+        else:
+            hidden.append(str(col))
+
+    if not keep_idx:
+        return [str(c) for c in columns], rows, []
+
+    vis_cols = [str(columns[i]) for i in keep_idx]
+    vis_rows = [[r[i] if i < len(r) else "" for i in keep_idx] for r in rows]
+    return vis_cols, vis_rows, hidden
+
+
+def _render_card_view(console: Console, columns: list[str], rows: list[list]) -> None:
+    """Renders wide rows as full-width Key: Value cards so borders never wrap."""
+    key_width = min(max((len(c) for c in columns), default=10), max(12, console.size.width // 3))
+
+    for idx, row in enumerate(rows, start=1):
+        console.print(Rule(f"[bold cyan]Row {idx}[/bold cyan]", align="left", style="dim"))
+        grid = Table.grid(padding=(0, 1), expand=True)
+        grid.add_column(style="bold cyan", width=key_width, overflow="fold")
+        grid.add_column(overflow="fold", ratio=1)
+
+        shown_any = False
+        for col, val in zip(columns, row):
+            text = _truncate(val, MAX_CARD_CELL_CHARS).strip()
+            if text:
+                grid.add_row(col, text)
+                shown_any = True
+        if not shown_any:
+            grid.add_row("(empty)", "[dim]all values NULL/blank[/dim]")
+        console.print(grid)
+
+
+def _render_table_view(console: Console, columns: list[str], rows: list[list]) -> None:
+    """Renders a clean, borderless horizontal-header table when columns fit the pane."""
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        show_header=True,
+        header_style="bold cyan",
+        pad_edge=False,
+        padding=(0, 1),
+        expand=True,
+    )
+    for col in columns:
+        table.add_column(col, overflow="fold")
+    for row in rows:
+        table.add_row(*(_truncate(v, MAX_TABLE_CELL_CHARS) for v in row))
+    console.print(table)
+
+
 def render_payload(console: Console, data: dict) -> None:
     if data.get("cleared"):
         _render_waiting(console)
@@ -84,29 +146,40 @@ def render_payload(console: Console, data: dict) -> None:
     rows = data.get("rows") or []
     truncated = bool(data.get("truncated", False))
 
+    vis_cols, vis_rows, hidden_cols = _filter_empty_columns(columns, rows) if rows else (columns, rows, [])
+    pane_width = max(30, console.size.width)
+    ncols = max(1, len(vis_cols))
+    avg_col_width = (pane_width - 2 * max(0, ncols - 1)) // ncols
+    use_cards = ncols > 1 and avg_col_width < MIN_TABLE_COL_WIDTH
+
     prefix = f"Query #{qid} — " if qid else ""
-    title = f"{prefix}{len(rows)}{'+' if truncated else ''} rows"
+    mode_tag = " [card view]" if (rows and use_cards) else ""
+    title = f"{prefix}{len(rows)}{'+' if truncated else ''} rows{mode_tag}"
 
     if sql:
         short_sql = sql if len(sql) <= 240 else sql[:239] + "…"
-        console.print(Panel(short_sql, title=title, border_style="cyan"))
+        console.print(
+            Panel(
+                Text(short_sql, overflow="fold"),
+                title=title,
+                title_align="left",
+                box=box.HORIZONTALS,
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        )
 
     if not rows:
         console.print("[dim][-] Query returned 0 rows.[/dim]")
         return
 
-    table = Table(
-        title=None if sql else title,
-        show_header=True,
-        header_style="bold cyan",
-        expand=True,
-    )
-    for col in columns:
-        table.add_column(str(col), overflow="fold")
-    for row in rows:
-        table.add_row(*(_truncate(v) for v in row))
+    if use_cards:
+        _render_card_view(console, vis_cols, vis_rows)
+    else:
+        _render_table_view(console, vis_cols, vis_rows)
 
-    console.print(table)
+    if hidden_cols:
+        console.print(f"[dim]Hidden empty columns: {', '.join(hidden_cols)}[/dim]")
     if truncated:
         console.print("[yellow][*] Output capped at max row limit.[/yellow]")
 
@@ -130,6 +203,8 @@ def watch(state_path: Path, parent_pid: int | None = None, poll_interval: float 
     _render_waiting(console)
 
     last_mtime: int | None = None
+    last_data: dict | None = None
+    last_size = console.size
     parent_died = False
 
     try:
@@ -150,10 +225,15 @@ def watch(state_path: Path, parent_pid: int | None = None, poll_interval: float 
                     data = json.loads(state_path.read_text(encoding="utf-8"))
                     if data.get("close"):
                         break
-                    render_payload(console, data)
+                    last_data = data
                     last_mtime = mtime
+                    last_size = console.size
+                    render_payload(console, data)
                 except (json.JSONDecodeError, OSError):
                     pass
+            elif last_data is not None and console.size != last_size:
+                last_size = console.size
+                render_payload(console, last_data)
 
             time.sleep(poll_interval)
     except KeyboardInterrupt:
