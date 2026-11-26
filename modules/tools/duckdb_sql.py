@@ -70,9 +70,7 @@ def validate_readonly_sql(sql: str) -> tuple[bool, str | None]:
 
 
 def _stringify(val: object) -> str:
-    if val is None:
-        return ""
-    return str(val)
+    return "" if val is None else str(val)
 
 
 def _trim_for_llm(columns: list[str], rows: list[list[str]]) -> tuple[list[dict[str, str]], bool]:
@@ -160,37 +158,7 @@ def execute_sql(
     return result
 
 
-SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "query_duckdb",
-        "description": (
-            "Execute a read-only DuckDB SQL query against the mounted forensic artifact views. "
-            "Always select only the columns you need and include LIMIT 50 or LIMIT 100 on non-aggregated queries."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sql": {
-                    "type": "string",
-                    "description": "Single read-only DuckDB SQL query (SELECT, WITH, DESCRIBE, SHOW, SUMMARIZE).",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Short explanation of what forensic question this query answers.",
-                },
-            },
-            "required": ["sql", "reason"],
-        },
-    },
-}
-
-# Aliases in case modules/tools/__init__.py expects SQL_SCHEMA / run_sql
-SQL_SCHEMA = SCHEMA
-
-
-def run_sql(args: dict, ctx: dict) -> dict:
-    """Tool entrypoint invoked by modules/tools/execute_tool."""
+def _query_duckdb(args: dict, ctx: dict) -> dict:
     sql = (args.get("sql") or "").strip()
     reason = (args.get("reason") or "Investigate forensic artifacts").strip()
 
@@ -214,6 +182,32 @@ def run_sql(args: dict, ctx: dict) -> dict:
     return execute_sql(ctx["con"], sql, state["history"], show_table=show_table)
 
 
-# Alias if your tool loader calls a generic `run` or `handler` function
-run = run_sql
-handler = run_sql
+REGISTER = [
+    {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "query_duckdb",
+                "description": (
+                    "Execute a read-only DuckDB SQL query against the mounted forensic artifact views. "
+                    "Always select only the columns you need and include LIMIT 50 or LIMIT 100 on non-aggregated queries."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "Single read-only DuckDB SQL query (SELECT, WITH, DESCRIBE, SHOW, SUMMARIZE).",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short explanation of what forensic question this query answers.",
+                        },
+                    },
+                    "required": ["sql", "reason"],
+                },
+            },
+        },
+        "handler": _query_duckdb,
+    }
+]

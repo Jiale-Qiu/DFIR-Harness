@@ -26,10 +26,7 @@ def _resolve_confined(base_output: Path, rel_path: str) -> tuple[Path | None, st
     base_resolved = base_output.resolve()
     raw = (rel_path or ".").strip()
     candidate = Path(raw)
-    if candidate.is_absolute():
-        target = candidate.resolve()
-    else:
-        target = (base_resolved / candidate).resolve()
+    target = candidate.resolve() if candidate.is_absolute() else (base_resolved / candidate).resolve()
 
     if not target.is_relative_to(base_resolved):
         return None, "Access denied: path escapes the case directory."
@@ -53,70 +50,7 @@ def _is_binary_file(path: Path) -> bool:
         return (non_text / len(sample)) > 0.2
 
 
-READ_FILE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "read_file",
-        "description": (
-            "Request analyst approval to safely read a bounded slice of a text file inside the case directory. "
-            "Large files are strictly paginated and capped to protect the context window. "
-            "For large CSVs already mounted in DuckDB, prefer SQL queries instead of read_file."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path from the case directory (as shown in the directory tree).",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Why you need to read this file.",
-                },
-                "start_line": {
-                    "type": "integer",
-                    "description": "1-based starting line number (default: 1).",
-                    "default": 1,
-                },
-                "max_lines": {
-                    "type": "integer",
-                    "description": f"Maximum lines to return (default: {DEFAULT_MAX_LINES}, hard cap: {MAX_LINES_CAP}).",
-                    "default": DEFAULT_MAX_LINES,
-                },
-                "search": {
-                    "type": "string",
-                    "description": "Optional case-insensitive substring filter; only matching lines are returned.",
-                },
-            },
-            "required": ["path", "reason"],
-        },
-    },
-}
-
-
-LIST_DIR_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "list_directory",
-        "description": (
-            "List files and subdirectories inside a specific folder of the case directory "
-            "(useful when the initial directory tree was truncated)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative directory path inside the case folder (default: '.').",
-                    "default": ".",
-                }
-            },
-        },
-    },
-}
-
-
-def run_read_file(args: dict, ctx: dict) -> dict:
+def _read_file(args: dict, ctx: dict) -> dict:
     base_output = Path(ctx["base_output"])
     rel_path = args.get("path", "")
     reason = args.get("reason", "Inspect file contents")
@@ -205,7 +139,7 @@ def run_read_file(args: dict, ctx: dict) -> dict:
     return result
 
 
-def run_list_directory(args: dict, ctx: dict) -> dict:
+def _list_directory(args: dict, ctx: dict) -> dict:
     base_output = Path(ctx["base_output"])
     rel_path = args.get("path", ".")
     target, err = _resolve_confined(base_output, rel_path)
@@ -232,3 +166,72 @@ def run_list_directory(args: dict, ctx: dict) -> dict:
         "truncated": len(entries) > MAX_LIST_ENTRIES,
         "entries": items,
     }
+
+
+REGISTER = [
+    {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": (
+                    "Request analyst approval to safely read a bounded slice of a text file inside the case directory. "
+                    "Large files are strictly paginated and capped to protect the context window. "
+                    "For large CSVs already mounted in DuckDB, prefer SQL queries instead of read_file."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path from the case directory (as shown in the directory tree).",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why you need to read this file.",
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based starting line number (default: 1).",
+                            "default": 1,
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "description": f"Maximum lines to return (default: {DEFAULT_MAX_LINES}, hard cap: {MAX_LINES_CAP}).",
+                            "default": DEFAULT_MAX_LINES,
+                        },
+                        "search": {
+                            "type": "string",
+                            "description": "Optional case-insensitive substring filter; only matching lines are returned.",
+                        },
+                    },
+                    "required": ["path", "reason"],
+                },
+            },
+        },
+        "handler": _read_file,
+    },
+    {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": (
+                    "List files and subdirectories inside a specific folder of the case directory "
+                    "(useful when the initial directory tree was truncated)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path inside the case folder (default: '.').",
+                            "default": ".",
+                        }
+                    },
+                },
+            },
+        },
+        "handler": _list_directory,
+    },
+]

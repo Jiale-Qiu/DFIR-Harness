@@ -12,38 +12,6 @@ MAX_TIMEOUT_SEC = 120
 MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
 
-TERMINAL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "run_terminal",
-        "description": (
-            "STRICT LAST RESORT ONLY. Proposes a local shell command for explicit human approval. "
-            "Do NOT call this if DuckDB SQL, read_file, list_directory, or any other built-in tool "
-            "can accomplish the task. You must explain in 'reason' why no other tool can do it. "
-            "Prefer read-only, targeted commands with bounded output."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The exact shell command to run inside the case directory.",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Why this command is necessary and why no other built-in tool suffices.",
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": f"Timeout in seconds (default: {DEFAULT_TIMEOUT_SEC}, max: {MAX_TIMEOUT_SEC}).",
-                    "default": DEFAULT_TIMEOUT_SEC,
-                },
-            },
-            "required": ["command", "reason"],
-        },
-    },
-}
-
 
 def _cap(text: str, limit: int) -> tuple[str, bool]:
     if len(text) <= limit:
@@ -51,7 +19,7 @@ def _cap(text: str, limit: int) -> tuple[str, bool]:
     return text[:limit] + f"\n... [truncated {len(text) - limit:,} chars]", True
 
 
-def run_terminal(args: dict, ctx: dict) -> dict:
+def _run_terminal(args: dict, ctx: dict) -> dict:
     command = (args.get("command") or "").strip()
     reason = (args.get("reason") or "").strip()
     if not command:
@@ -94,3 +62,41 @@ def run_terminal(args: dict, ctx: dict) -> dict:
         "stderr": stderr,
         "truncated": out_trunc or err_trunc,
     }
+
+
+REGISTER = [
+    {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "run_terminal",
+                "description": (
+                    "STRICT LAST RESORT ONLY. Proposes a local shell command for explicit human approval. "
+                    "Do NOT call this if DuckDB SQL, read_file, list_directory, or any other built-in tool "
+                    "can accomplish the task. You must explain in 'reason' why no other tool can do it. "
+                    "Prefer read-only, targeted commands with bounded output."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The exact shell command to run inside the case directory.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why this command is necessary and why no other built-in tool suffices.",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": f"Timeout in seconds (default: {DEFAULT_TIMEOUT_SEC}, max: {MAX_TIMEOUT_SEC}).",
+                            "default": DEFAULT_TIMEOUT_SEC,
+                        },
+                    },
+                    "required": ["command", "reason"],
+                },
+            },
+        },
+        "handler": _run_terminal,
+    }
+]
