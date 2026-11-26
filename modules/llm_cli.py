@@ -1,5 +1,5 @@
 """
-# NVIDIA NIM (paste the exact model ID shown on the NIM page)
+# NVIDIA NIM
 $env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
 $env:OPENAI_API_KEY="nvapi-your-key-here"
 $env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
@@ -32,6 +32,7 @@ MAX_TRIAGE_CHARS = 6000
 
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
+    """Extracts row counts and column names for each mounted DuckDB view."""
     schemas = {}
     for view in sorted(mounted_views):
         try:
@@ -54,6 +55,7 @@ def _list_case_csvs(base_output: Path) -> list[str]:
 
 
 def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
+    """Builds the DFIR system prompt grounded in live DuckDB schemas and optional triage output."""
     schema_lines = [
         f"- `{view}` ({info['rows']:,} rows): {', '.join(info['columns'])}"
         for view, info in schemas.items()
@@ -80,7 +82,7 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
         + "\n".join(schema_lines)
         + "\n\n### Parsed CSV Files on Disk\n"
         + ("\n".join(csv_lines) if csv_lines else "- (none)")
-        + "\n\n### Critical DuckDB Query Rules\n"
+        + "\n\n### Critical DuckDB Query & Tool Rules\n"
         "1. Every view was mounted with `all_varchar=true` — ALL columns are VARCHAR strings.\n"
         "   - Compare IDs as strings (e.g., `EventId = '4624'`).\n"
         "   - Use `TRY_CAST(col AS BIGINT)` for numeric sorting/filtering.\n"
@@ -88,21 +90,32 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
         "2. Always include `LIMIT 50` or `LIMIT 100` on non-aggregated queries (output caps at 100 rows).\n"
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
-        "5. If the analyst declines a tool action, respect the decision and ask how they want to proceed."
+        "5. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
+        f"6. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
+        "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
+        "to synthesize findings rather than issuing another query."
         + triage_block
     )
 
 
-def _stream_completion(client: OpenAI, model: str, messages: list[dict], state: dict):
+def _stream_completion(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    state: dict,
+    allow_tools: bool = True,
+):
+    """Streams one LLM turn, returning (reply_text, tool_calls_list, finish_reason)."""
     request_kwargs = {
         "model": model,
         "messages": messages,
-        "tools": TOOL_SCHEMAS,
-        "tool_choice": "auto",
         "temperature": 0.3,
         "max_tokens": 4096,
         "stream": True,
     }
+    if TOOL_SCHEMAS:
+        request_kwargs["tools"] = TOOL_SCHEMAS
+        request_kwargs["tool_choice"] = "auto" if allow_tools else "none"
     if state["reasoning"] != "off":
         request_kwargs["extra_body"] = {"reasoning_effort": state["reasoning"]}
 
@@ -155,6 +168,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list[dict], state: 
 
 
 def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: list[dict]) -> bool:
+    """Handles local CLI commands. Returns True if input was consumed locally."""
     cmd, _, arg = user_input.partition(" ")
     cmd_lower = cmd.lower()
     arg = arg.strip()
@@ -228,6 +242,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
 
 
 def start_cli(con, mounted_views: set[str], base_output: Path):
+    """Interactive DFIR investigation CLI with DuckDB schema grounding and HITL tool execution."""
     api_key = os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("LLM_MODEL")
 
@@ -279,8 +294,12 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
         messages.append({"role": "user", "content": user_input})
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
-                reply, tool_calls, finish_reason = _stream_completion(client, model, messages, ctx["state"])
+            for round_idx in range(MAX_TOOL_ROUNDS):
+                # Reserve the final round for synthesis so the turn never ends without a summary
+                allow_tools = round_idx < (MAX_TOOL_ROUNDS - 1)
+                reply, tool_calls, finish_reason = _stream_completion(
+                    client, model, messages, ctx["state"], allow_tools=allow_tools
+                )
 
                 if finish_reason == "length":
                     console.print("[yellow][!] Response hit max_tokens (4096) and was cut short.[/yellow]\n")
