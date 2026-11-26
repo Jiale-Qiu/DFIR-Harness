@@ -79,9 +79,7 @@ def _handle_tool(args: dict, ctx: dict) -> dict:
     if decision == "no":
         return {"status": "rejected_by_analyst", "message": "Analyst declined to execute this query."}
 
-    state = ctx["state"]
-    show = (decision == "table") or state["auto_tables"]
-    return execute_sql(ctx["con"], sql, state["history"], show_table=show)
+    return execute_sql(ctx["con"], sql, ctx["state"]["history"], show_table=(decision == "table"))
 
 
 REGISTER = [

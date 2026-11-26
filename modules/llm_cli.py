@@ -19,7 +19,7 @@ from openai import OpenAI
 from rich.live import Live
 from rich.table import Table
 
-from modules.llm_ui import StreamRenderer, console, print_result_table
+from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
 from modules.tools import TOOL_SCHEMAS, execute_tool, list_tools
 from modules.tools.duckdb_sql import execute_sql
 
@@ -160,6 +160,10 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     arg = arg.strip()
     state = ctx["state"]
 
+    if cmd_lower in ("/help", "/?"):
+        print_help()
+        return True
+
     if cmd_lower == "/reasoning":
         if arg.lower() in VALID_LEVELS:
             state["reasoning"] = arg.lower()
@@ -174,11 +178,6 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
             console.print(f"[cyan][*] Thinking display set to: {state['thinking_mode']}[/cyan]\n")
         else:
             console.print(f"[yellow][!] Current: {state['thinking_mode']} | Usage: /thinking <collapse|full|off>[/yellow]\n")
-        return True
-
-    if cmd_lower == "/tables":
-        state["auto_tables"] = not state["auto_tables"]
-        console.print(f"[cyan][*] Auto-tables: {'ON' if state['auto_tables'] else 'OFF'}[/cyan]\n")
         return True
 
     if cmd_lower == "/show":
@@ -250,17 +249,15 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
         "state": {
             "reasoning": DEFAULT_REASONING,
             "thinking_mode": DEFAULT_THINKING_MODE,
-            "auto_tables": False,
             "history": [],
         },
     }
     messages = [{"role": "system", "content": _build_system_prompt(schemas, Path(base_output))}]
 
     console.print("\n[bold cyan]=== LLM Investigation CLI ===[/bold cyan]")
-    console.print(f"[dim]Model: {model} | Views: {', '.join(sorted(schemas))} | Tools: {len(active_tools)} loaded[/dim]")
     console.print(
-        "[dim]Commands: /show [n], /tables, /tools, /thinking <collapse|full|off>, "
-        "/reasoning <low|medium|high|off>, /sql, /schema, /clear, exit[/dim]\n"
+        f"[dim]Model: {model} | Views: {', '.join(sorted(schemas))} | "
+        f"Tools: {len(active_tools)} loaded | Type /help for commands[/dim]\n"
     )
 
     while True:

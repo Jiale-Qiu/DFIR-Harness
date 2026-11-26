@@ -1,7 +1,8 @@
 import threading
+from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
-from rich.padding import Padding
+from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
@@ -101,6 +102,29 @@ class StreamRenderer:
         return Group(*parts)
 
 
+def print_help():
+    """Prints available investigation CLI slash commands."""
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", padding=(0, 2, 0, 0))
+    table.add_column("Command", style="bold green")
+    table.add_column("Description")
+
+    commands = [
+        ("/show [n]", "Print the result table for query #n (defaults to latest)"),
+        ("/sql <query>", "Execute a read-only DuckDB SQL query directly"),
+        ("/schema", "List mounted DuckDB views, row counts, and columns"),
+        ("/tools", "List loaded AI tools from modules/tools/"),
+        ("/reasoning <level>", "Set reasoning effort: low, medium, high, or off"),
+        ("/thinking <mode>", "Set thinking display: collapse, full, or off"),
+        ("/clear", "Clear conversation history and cached query results"),
+        ("/help", "Show this command reference"),
+        ("exit", "Exit the investigation CLI"),
+    ]
+    for cmd, desc in commands:
+        table.add_row(cmd, desc)
+
+    console.print(table)
+
+
 def print_result_table(entry: dict, max_rows: int = 50):
     """Renders a cached query result entry as a Rich Table."""
     rows = entry["rows"]
@@ -125,9 +149,23 @@ def print_result_table(entry: dict, max_rows: int = 50):
 
 
 def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str:
-    """Displays a compact SQL proposal and returns 'yes', 'table', or 'no'."""
-    console.print(Text.assemble(("\n[Proposed SQL] ", "bold cyan"), (reason or "No reason given", "italic")))
-    console.print(Padding(Syntax(sql.strip(), "sql", theme="monokai", word_wrap=True), (0, 0, 0, 2)))
+    """Displays a sleek, compact SQL proposal and returns 'yes', 'table', or 'no'."""
+    content = Group(
+        Text.assemble(("Rationale: ", "bold yellow"), (reason or "No reason given", "italic")),
+        Text(""),
+        Syntax(sql.strip(), "sql", theme="monokai", word_wrap=True),
+    )
+    console.print()
+    console.print(
+        Panel(
+            content,
+            title="[bold cyan]Proposed SQL[/bold cyan]",
+            title_align="left",
+            box=box.HORIZONTALS,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
 
     if has_inner_semicolon:
         console.print("[yellow][!] Note: Query contains an internal semicolon — inspect carefully.[/yellow]")
@@ -151,9 +189,18 @@ def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str
 
 def confirm_action(title: str, details: list[str], prompt: str = "Proceed? [Y]es / [n]o: ") -> bool:
     """Generic HITL approval prompt for side-effect tools like launching GUI viewers."""
-    console.print(Text.assemble((f"\n[{title}]", "bold cyan")))
-    for line in details:
-        console.print(f"  {line}")
+    body = Group(*(Text(f"• {line}") for line in details))
+    console.print()
+    console.print(
+        Panel(
+            body,
+            title=f"[bold cyan]{title}[/bold cyan]",
+            title_align="left",
+            box=box.HORIZONTALS,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
 
     while True:
         try:
