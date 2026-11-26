@@ -2,7 +2,7 @@ import argparse
 import shutil
 from pathlib import Path
 from modules import scanner, preflight
-from modules.parsers import prefetchParser, evtxParser
+from modules.parsers import evtxParser, registryParser, prefetchParser, mftParser
 from rich.console import Console
 import time
 
@@ -10,7 +10,9 @@ console = Console(highlight=False)
 
 PARSERS = {
     "evtx": evtxParser.parse,
+    "registry": registryParser.parse,
     "prefetch": prefetchParser.parse,
+    "mft": mftParser.parse,
 }
 
 def getValidDirectory(cli_path=None):
