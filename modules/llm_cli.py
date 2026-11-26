@@ -52,23 +52,61 @@ def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
     return schemas
 
 
-def _list_case_csvs(base_output: Path) -> list[str]:
-    """Lists relative CSV paths in base_output so the LLM knows exact filenames for GUI handoff."""
-    csv_lines = []
-    for p in sorted(base_output.rglob("*.csv")):
-        if p.stat().st_size > 0:
-            size_mb = p.stat().st_size / (1024 * 1024)
-            csv_lines.append(f"- `{p.relative_to(base_output).as_posix()}` ({size_mb:.2f} MB)")
-    return csv_lines
+def _format_bytes(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _build_directory_tree(base_output: Path, max_entries: int = 120, max_depth: int = 4) -> str:
+    """Builds a bounded indented tree of all files/folders in base_output."""
+    lines: list[str] = [f"{base_output.name}/"]
+    count = 0
+    truncated = False
+
+    def _walk(directory: Path, depth: int) -> None:
+        nonlocal count, truncated
+        if depth > max_depth or truncated:
+            return
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError:
+            return
+
+        indent = "  " * depth
+        for entry in entries:
+            if count >= max_entries:
+                truncated = True
+                return
+            count += 1
+            if entry.is_dir():
+                lines.append(f"{indent}{entry.name}/")
+                if depth == max_depth:
+                    lines.append(f"{indent}  … (use list_directory to inspect deeper)")
+                else:
+                    _walk(entry, depth + 1)
+            else:
+                try:
+                    sz = _format_bytes(entry.stat().st_size)
+                except OSError:
+                    sz = "?"
+                lines.append(f"{indent}{entry.name} ({sz})")
+
+    _walk(base_output, 1)
+    if truncated:
+        lines.append(f"... (tree capped at {max_entries} entries — use list_directory for specific folders)")
+    return "\n".join(lines)
 
 
 def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
-    """Builds the DFIR system prompt grounded in live DuckDB schemas and optional triage output."""
+    """Builds the DFIR system prompt grounded in live DuckDB schemas, file tree, and triage output."""
     schema_lines = [
         f"- `{view}` ({info['rows']:,} rows): {', '.join(info['columns'])}"
         for view, info in schemas.items()
     ]
-    csv_lines = _list_case_csvs(base_output)
+    dir_tree = _build_directory_tree(base_output)
 
     triage_block = ""
     summary_path = base_output / "triage_summary.json"
@@ -84,22 +122,29 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
 
     return (
         "You are an expert Windows DFIR analyst assisting a human investigator.\n"
-        "Use your registered tools to query DuckDB artifacts, decode obfuscated payloads, calculate offsets, "
+        "Use your registered tools to query DuckDB artifacts, inspect case files, decode obfuscated payloads, "
         "or open Timeline Explorer when the analyst wants to inspect raw CSVs visually.\n\n"
         "### Mounted DuckDB Views & Columns\n"
         + "\n".join(schema_lines)
-        + "\n\n### Parsed CSV Files on Disk\n"
-        + ("\n".join(csv_lines) if csv_lines else "- (none)")
-        + "\n\n### Critical DuckDB Query & Tool Rules\n"
-        "1. Every view was mounted with `all_varchar=true` — ALL columns are VARCHAR strings.\n"
+        + "\n\n### Case Directory Tree\n```\n"
+        + dir_tree
+        + "\n```\n\n### Critical Tool & Query Rules\n"
+        "1. Every DuckDB view was mounted with `all_varchar=true` — ALL columns are VARCHAR strings.\n"
         "   - Compare IDs as strings (e.g., `EventId = '4624'`).\n"
         "   - Use `TRY_CAST(col AS BIGINT)` for numeric sorting/filtering.\n"
         "   - Use `ILIKE` for case-insensitive Windows path/filename matching.\n"
         "2. Always include `LIMIT 50` or `LIMIT 100` on non-aggregated queries (output caps at 100 rows).\n"
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
-        "5. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
-        f"6. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
+        "5. File Inspection (`read_file` / `list_directory`): Use `read_file` to inspect logs, scripts, JSON, "
+        "or unmounted text artifacts. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
+        "slices rather than trying to read whole files. Never use `read_file` on large CSVs that are already "
+        "mounted in DuckDB.\n"
+        "6. Terminal Execution (`run_terminal`) — STRICT LAST RESORT ONLY: Only propose a terminal command "
+        "when NO other registered tool (DuckDB SQL, `read_file`, `list_directory`, decoders, etc.) can complete "
+        "the task. Always state in `reason` why built-in tools cannot do it, and keep commands read-only and output-bounded.\n"
+        "7. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
+        f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
         "to synthesize findings rather than issuing another query."
         + triage_block
@@ -203,6 +248,27 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
             console.print("[yellow][!] /pane requires Windows Terminal.[/yellow]\n")
         return True
 
+    if cmd_lower == "/autosql":
+        arg_lower = arg.lower()
+        if arg_lower in ("on", "true", "1"):
+            state["auto_sql"] = True
+        elif arg_lower in ("off", "false", "0"):
+            state["auto_sql"] = False
+        elif not arg_lower:
+            state["auto_sql"] = not state["auto_sql"]
+        else:
+            console.print("[yellow][!] Usage: /autosql [on|off][/yellow]\n")
+            return True
+
+        status = (
+            "ON (validated read-only SQL auto-runs; terminal commands still require approval)"
+            if state["auto_sql"]
+            else "OFF (manual approval required)"
+        )
+        style = "yellow" if state["auto_sql"] else "cyan"
+        console.print(f"[{style}][*] Auto-accept SQL: {status}[/{style}]\n")
+        return True
+
     if cmd_lower == "/reasoning":
         if arg.lower() in VALID_LEVELS:
             state["reasoning"] = arg.lower()
@@ -302,6 +368,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
         "state": {
             "reasoning": DEFAULT_REASONING,
             "thinking_mode": DEFAULT_THINKING_MODE,
+            "auto_sql": False,
             "history": [],
             "pane_path": pane_path,
         },

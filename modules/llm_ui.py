@@ -235,6 +235,7 @@ def print_help():
         ("/pane [off]", "Open right-side query viewer pane (or '/pane off' to close it)"),
         ("/show [n]", "Show the result table for query #n (defaults to latest)"),
         ("/sql <query>", "Execute a read-only DuckDB SQL query directly"),
+        ("/autosql [on|off]", "Toggle auto-accept for validated read-only SQL (default: off)"),
         ("/schema", "List mounted DuckDB views, row counts, and columns"),
         ("/tools", "List loaded AI tools from modules/tools/"),
         ("/reasoning <level>", "Set reasoning effort: low, medium, high, or off"),
@@ -339,3 +340,40 @@ def confirm_action(title: str, details: list[str], prompt: str = "Proceed? [Y]es
             console.print("[yellow][-] Action declined.[/yellow]")
             return False
         console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
+
+def confirm_terminal(reason: str, command: str, cwd: str) -> bool:
+    """High-visibility HITL prompt for last-resort shell commands. Defaults to NO on Enter."""
+    import os
+
+    lexer = "powershell" if os.name == "nt" else "bash"
+    content = Group(
+        Text.assemble(("Working Dir: ", "bold yellow"), (cwd, "dim")),
+        Text.assemble(("Rationale:   ", "bold yellow"), (reason or "No reason given", "italic")),
+        Text(""),
+        Syntax(command.strip(), lexer, theme="monokai", word_wrap=True),
+    )
+    console.print()
+    console.print(
+        Panel(
+            content,
+            title="[bold red]Proposed Terminal Command (Last Resort)[/bold red]",
+            title_align="left",
+            box=box.HORIZONTALS,
+            border_style="red",
+            padding=(0, 1),
+        )
+    )
+
+    while True:
+        try:
+            choice = input("Execute shell command? [y]es / [N]o: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("[yellow][-] Terminal command declined.[/yellow]")
+            return False
+
+        if choice in ("y", "yes"):
+            return True
+        if choice in ("", "n", "no"):
+            console.print("[yellow][-] Terminal command declined.[/yellow]")
+            return False
+        console.print("[red][!] Enter y to execute, or press Enter / n to decline.[/red]")
