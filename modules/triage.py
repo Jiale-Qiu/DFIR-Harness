@@ -2,15 +2,13 @@ import duckdb
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
+from modules import hunts
 
 console = Console(highlight=False)
 
-def run_triage(base_output: Path):
-    # 1. Start DuckDB in memory and cap its RAM
-    con = duckdb.connect(":memory:")
-    con.execute("SET memory_limit = '2GB';")
 
-    # 2. Map each SQL view name to its folder and filename pattern
+def mount_views(con, base_output: Path) -> set[str]:
+    """Mounts available CSV folders as DuckDB views and returns the active view names."""
     sources = {
         "evtx": (base_output / "evtx", "*.csv"),
         "prefetch": (base_output / "prefetch", "*_PECmd_Output.csv"),
@@ -19,23 +17,19 @@ def run_triage(base_output: Path):
         "mft": (base_output / "mft", "*.csv"),
     }
 
-    # 3. Set up the Rich summary table
     table = Table(title="DuckDB Mounted Views")
     table.add_column("View Name", style="bold cyan")
     table.add_column("CSV Files", justify="right")
     table.add_column("Total Rows", justify="right")
 
-    # 4. Find the CSVs, mount each view, and count the rows
+    mounted_views = set()
+
     for view_name, (folder, pattern) in sources.items():
         csv_files = [f for f in folder.glob(pattern) if f.stat().st_size > 0]
         if not csv_files:
             continue
 
-        # Convert Path objects into a SQL list of file paths: ['path1', 'path2']
-        sql_paths = []
-        for f in csv_files:
-            clean_path = f.as_posix().replace("'", "''")
-            sql_paths.append(f"'{clean_path}'")
+        sql_paths = [f"'{f.as_posix().replace(chr(39), chr(39)*2)}'" for f in csv_files]
         files_list = ", ".join(sql_paths)
 
         try:
@@ -49,11 +43,43 @@ def run_triage(base_output: Path):
                     ignore_errors=true
                 )
             """)
-
             row_count = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()[0]
             table.add_row(view_name, str(len(csv_files)), f"{row_count:,}")
+            mounted_views.add(view_name)
         except duckdb.Error as e:
             console.print(f"[red][!] Could not mount '{view_name}': {e}[/red]")
 
-    console.print(table)
-    con.close()
+    if mounted_views:
+        console.print(table)
+    return mounted_views
+
+
+def llm_cli_placeholder(con, mounted_views: set[str], base_output: Path):
+    """Placeholder for Milestone 4: Interactive LLM investigation loop."""
+    console.print("\n[bold cyan]=== Entering LLM Investigation CLI (Placeholder) ===[/bold cyan]")
+    console.print(f"Active DuckDB views ready for querying: {', '.join(sorted(mounted_views))}")
+    console.print("[dim](Milestone 4 LLM loop will live here while DuckDB remains open.)[/dim]\n")
+
+
+def run_triage(base_output: Path):
+    with duckdb.connect(":memory:") as con:
+        con.execute("SET memory_limit = '2GB';")
+
+        mounted_views = mount_views(con, base_output)
+        if not mounted_views:
+            console.print("[yellow][!] No valid CSVs found to mount in DuckDB.[/yellow]")
+            return
+
+        console.print("\nRun initial triage (default baseline queries for available artifacts)?")
+        while True:
+            choice = input("Continue? [Y]es / [n]o: ").strip().lower()
+            if choice in ("", "y", "yes"):
+                hunts.run_all(con, mounted_views, base_output)
+                break
+            elif choice in ("n", "no"):
+                console.print("[yellow][-] Skipping initial triage queries.[/yellow]")
+                break
+            else:
+                console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
+
+        llm_cli_placeholder(con, mounted_views, base_output)
