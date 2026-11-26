@@ -1,7 +1,7 @@
 import argparse
 import shutil
 from pathlib import Path
-from modules import scanner, preflight
+from modules import scanner, preflight, triage
 from modules.parsers import evtxParser, registryParser, prefetchParser, mftParser
 from rich.console import Console
 import time
@@ -107,8 +107,8 @@ def main():
             console.print(f"[cyan][*] Running {category.upper()} parser...[/cyan]")
             PARSERS[category](file_list, category_out, dry_run=args.dry_run)
 
-    # Milestone 3 hook: everything below runs regardless of whether CSVs were just parsed or loaded via --skip-parse
-    console.print(f"\n[green][+] Ready for DuckDB triage against: {base_output.resolve()}[/green]")
+    if not args.dry_run:
+        triage.run_triage(base_output)
 
 if __name__ == "__main__":
     main()
