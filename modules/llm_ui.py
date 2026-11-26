@@ -14,7 +14,7 @@ console = Console(highlight=False)
 
 
 class StreamRenderer:
-    """Scroll-safe Markdown streamer with a 1-line transient status spinner."""
+    """Scroll-safe Markdown streamer with live-then-collapsing thinking display."""
 
     def __init__(self, reasoning_level: str, thinking_mode: str):
         self.reasoning_level = reasoning_level
@@ -59,12 +59,25 @@ class StreamRenderer:
         target.print(renderable)
 
     def add_thinking(self, token: str) -> None:
+        if self.thinking_mode == "off":
+            with self._lock:
+                self._thinking_chars += len(token)
+            return
+
+        if self.thinking_mode == "collapse":
+            with self._lock:
+                if self._thinking_chars == 0:
+                    token = token.lstrip()
+                    if not token:
+                        return
+                self._thinking_chars += len(token)
+                self._thinking_buf += token
+            return
+
+        # thinking_mode == "full": stream permanently into scrollback
         with self._lock:
             is_first = self._thinking_chars == 0
             self._thinking_chars += len(token)
-
-        if self.thinking_mode != "full":
-            return
 
         if is_first:
             token = token.lstrip()
@@ -101,12 +114,13 @@ class StreamRenderer:
             self._status_note = note
 
     def _finalize_thinking(self, use_live: bool = True) -> None:
-        if self._thinking_finalized:
-            return
-        self._thinking_finalized = True
-
         with self._lock:
+            if self._thinking_finalized:
+                return
+            self._thinking_finalized = True
             chars = self._thinking_chars
+            leftover = self._thinking_buf if self.thinking_mode == "full" else ""
+            self._thinking_buf = ""
 
         if chars == 0 or self.thinking_mode == "off":
             return
@@ -114,16 +128,15 @@ class StreamRenderer:
         if self.thinking_mode == "collapse":
             self._emit(
                 Text(
-                    f"  [Thought process collapsed ({chars:,} chars — /thinking full to expand)]",
+                    f"  [Thought process collapsed ({chars:,} chars — /thinking full to keep expanded)]",
                     style="dim italic",
                 ),
                 use_live=use_live,
             )
             self._emit(Text(""), use_live=use_live)
         elif self.thinking_mode == "full":
-            if self._thinking_buf.strip():
-                self._emit(Text(self._thinking_buf, style="dim italic"), use_live=use_live)
-            self._thinking_buf = ""
+            if leftover.strip():
+                self._emit(Text(leftover, style="dim italic"), use_live=use_live)
             self._emit(Text(""), use_live=use_live)
 
     def _flush_complete_blocks(self) -> None:
@@ -168,6 +181,12 @@ class StreamRenderer:
             thinking_chars = self._thinking_chars
             answer_chars = self._answer_chars
             answer_started = self._answer_started
+            show_live_thinking = (
+                self.thinking_mode == "collapse"
+                and not self._thinking_finalized
+                and bool(self._thinking_buf)
+            )
+            thinking_text = self._thinking_buf if show_live_thinking else ""
 
         if status_note:
             label = Text(status_note, style="dim cyan")
@@ -178,7 +197,32 @@ class StreamRenderer:
         else:
             label = Text("Thinking...", style="dim")
 
-        return Columns([self._spinner, label], padding=(0, 1))
+        status_row = Columns([self._spinner, label], padding=(0, 1))
+        if not thinking_text:
+            return status_row
+
+        inner_width = max(20, console.size.width - 6)
+        max_visible_rows = max(4, console.size.height - 6)
+        char_budget = max_visible_rows * inner_width + 500
+        snippet = thinking_text[-char_budget:] if len(thinking_text) > char_budget else thinking_text
+        wrapped = Text(snippet.replace("\r", ""), style="dim italic").wrap(console, inner_width)
+
+        if len(wrapped) > max_visible_rows:
+            visible = wrapped[-max_visible_rows:]
+            title = f"[dim]Thinking ({thinking_chars:,} chars — live tail)[/dim]"
+        else:
+            visible = wrapped
+            title = f"[dim]Thinking ({thinking_chars:,} chars)[/dim]"
+
+        panel = Panel(
+            Text("\n").join(visible),
+            title=title,
+            title_align="left",
+            box=box.HORIZONTALS,
+            border_style="dim",
+            padding=(0, 1),
+        )
+        return Group(panel, status_row)
 
 
 def print_help():
@@ -188,13 +232,13 @@ def print_help():
     table.add_column("Description")
 
     commands = [
-        ("/pane [off]", "Open right-side query viewer pane (or '/pane off' to print inline)"),
+        ("/pane [off]", "Open right-side query viewer pane (or '/pane off' to close it)"),
         ("/show [n]", "Show the result table for query #n (defaults to latest)"),
         ("/sql <query>", "Execute a read-only DuckDB SQL query directly"),
         ("/schema", "List mounted DuckDB views, row counts, and columns"),
         ("/tools", "List loaded AI tools from modules/tools/"),
         ("/reasoning <level>", "Set reasoning effort: low, medium, high, or off"),
-        ("/thinking <mode>", "Set thinking display: collapse, full, or off"),
+        ("/thinking <mode>", "Set thinking display: collapse (live->collapse), full, or off"),
         ("/clear", "Clear conversation history and cached query results"),
         ("/help", "Show this command reference"),
         ("exit", "Exit the investigation CLI"),

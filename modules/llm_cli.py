@@ -21,7 +21,9 @@ from rich.table import Table
 from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
 from modules.pane_bridge import (
     clear_result_pane,
+    close_result_pane,
     get_session_state_path,
+    is_pane_alive,
     open_result_pane,
     publish_result,
 )
@@ -174,6 +176,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     cmd_lower = cmd.lower()
     arg = arg.strip()
     state = ctx["state"]
+    pane_path = state["pane_path"]
 
     if cmd_lower in ("/help", "/?"):
         print_help()
@@ -181,14 +184,16 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
 
     if cmd_lower == "/pane":
         if arg.lower() == "off":
-            state["pane_open"] = False
-            console.print("[cyan][*] Switched /show and /sql back to inline mode.[/cyan]\n")
+            close_result_pane(pane_path)
+            console.print("[cyan][*] Closed query viewer pane and switched back to inline mode.[/cyan]\n")
             return True
-        if open_result_pane(state["pane_path"]):
-            state["pane_open"] = True
-            if state["history"]:
-                publish_result(state["pane_path"], state["history"][-1])
-            console.print("[cyan][*] Opened right-side query viewer pane (Ctrl+Shift+W in pane to close; '/pane off' for inline).[/cyan]\n")
+
+        latest = state["history"][-1] if state["history"] else None
+        status = open_result_pane(pane_path, initial_entry=latest)
+        if status == "opened":
+            console.print("[cyan][*] Opened right-side query viewer pane (type '/pane off' to close).[/cyan]\n")
+        elif status == "already_open":
+            console.print("[cyan][*] Query viewer pane is already open.[/cyan]\n")
         else:
             console.print("[yellow][!] /pane requires Windows Terminal.[/yellow]\n")
         return True
@@ -222,8 +227,8 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
             idx = int(arg) - 1
 
         entry = history[idx]
-        publish_result(state["pane_path"], entry)
-        if state["pane_open"]:
+        if is_pane_alive(pane_path):
+            publish_result(pane_path, entry)
             qid = entry.get("id") or (idx + 1)
             console.print(f"[cyan][*] Displayed Query #{qid} in right pane.[/cyan]\n")
         else:
@@ -235,10 +240,11 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         if not arg:
             console.print("[yellow][!] Usage: /sql SELECT * FROM evtx LIMIT 5[/yellow]\n")
         else:
+            pane_active = is_pane_alive(pane_path)
             prev_len = len(state["history"])
-            execute_sql(ctx["con"], arg, state["history"], show_table=not state["pane_open"])
-            if len(state["history"]) > prev_len:
-                publish_result(state["pane_path"], state["history"][-1])
+            execute_sql(ctx["con"], arg, state["history"], show_table=not pane_active)
+            if pane_active and len(state["history"]) > prev_len:
+                publish_result(pane_path, state["history"][-1])
             print()
         return True
 
@@ -260,7 +266,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     if cmd_lower == "/clear":
         del messages[1:]
         state["history"].clear()
-        clear_result_pane(state["pane_path"])
+        clear_result_pane(pane_path)
         console.print("[cyan][*] Conversation and query cache cleared.[/cyan]\n")
         return True
 
@@ -293,7 +299,6 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
             "thinking_mode": DEFAULT_THINKING_MODE,
             "history": [],
             "pane_path": pane_path,
-            "pane_open": False,
         },
     }
     messages = [{"role": "system", "content": _build_system_prompt(schemas, Path(base_output))}]
@@ -347,7 +352,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
                         prev_len = len(ctx["state"]["history"])
                         result = execute_tool(tc["function"]["name"], tc["function"]["arguments"], ctx)
                         if len(ctx["state"]["history"]) > prev_len:
-                            publish_result(ctx["state"]["pane_path"], ctx["state"]["history"][-1])
+                            publish_result(pane_path, ctx["state"]["history"][-1])
                         messages.append(
                             {
                                 "role": "tool",
@@ -365,4 +370,4 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
                 console.print(f"\n[red][!] API Error: {e}[/red]\n")
                 del messages[turn_start_idx:]
     finally:
-        pane_path.unlink(missing_ok=True)
+        close_result_pane(pane_path)
