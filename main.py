@@ -2,13 +2,14 @@ import argparse
 import shutil
 from pathlib import Path
 from modules import scanner, preflight
-from modules.parsers import prefetchParser
+from modules.parsers import prefetchParser, evtxParser
 from rich.console import Console
 import time
 
 console = Console(highlight=False)
 
 PARSERS = {
+    "evtx": evtxParser.parse,
     "prefetch": prefetchParser.parse,
 }
 
@@ -60,7 +61,7 @@ def main():
         console.print(f"{category.upper()}: {len(items)} files")
         time.sleep(0.05)
 
-    # HITL Parsing Loop
+    # Parsing Loop
     parse_all = False
 
     for category, file_list in files.items():
