@@ -2,10 +2,9 @@ import duckdb
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
-from modules import hunts
+from modules import hunts, llm_cli
 
 console = Console(highlight=False)
-
 
 def mount_views(con, base_output: Path) -> set[str]:
     """Mounts available CSV folders as DuckDB views and returns the active view names."""
@@ -82,4 +81,4 @@ def run_triage(base_output: Path):
             else:
                 console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
 
-        llm_cli_placeholder(con, mounted_views, base_output)
+        llm_cli.start_cli(con, mounted_views, base_output)
