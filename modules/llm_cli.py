@@ -18,7 +18,7 @@ console = Console(highlight=False)
 
 
 def start_cli(con, mounted_views: set[str], base_output):
-    """Minimal interactive chat loop configured purely via environment variables."""
+    """Interactive chat loop with token streaming."""
     api_key = os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("LLM_MODEL")
 
@@ -26,7 +26,6 @@ def start_cli(con, mounted_views: set[str], base_output):
         console.print("[red][!] Missing config. Set OPENAI_API_KEY, OPENAI_BASE_URL, and LLM_MODEL.[/red]")
         return
 
-    # OpenAI() automatically reads OPENAI_API_KEY and OPENAI_BASE_URL from the environment
     client = OpenAI()
 
     messages = [
@@ -55,17 +54,34 @@ def start_cli(con, mounted_views: set[str], base_output):
         messages.append({"role": "user", "content": user_input})
 
         try:
-            with console.status("[cyan]Thinking...[/cyan]", spinner="dots"):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.6,
-                    max_tokens=1024,
-                )
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.6,
+                max_tokens=1024,
+                stream=True,
+            )
 
-            reply = response.choices[0].message.content or "(Empty response)"
-            messages.append({"role": "assistant", "content": reply})
-            console.print(f"\n[bold green]AI >[/bold green] {reply}\n")
+            console.print("\n[bold green]AI >[/bold green] ", end="")
+            reply_chunks = []
+
+            for chunk in stream:
+                # Some providers send empty keep-alive or usage chunks at the end
+                if not chunk.choices:
+                    continue
+
+                token = chunk.choices[0].delta.content
+                if token:
+                    print(token, end="", flush=True)
+                    reply_chunks.append(token)
+
+            print("\n")  # Clean spacing after the stream finishes
+
+            full_reply = "".join(reply_chunks)
+            if full_reply:
+                messages.append({"role": "assistant", "content": full_reply})
+            else:
+                messages.pop()
 
         except Exception as e:
             console.print(f"\n[red][!] API Error: {e}[/red]\n")
