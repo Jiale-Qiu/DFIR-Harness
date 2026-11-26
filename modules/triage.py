@@ -60,7 +60,7 @@ def llm_cli_placeholder(con, mounted_views: set[str], base_output: Path):
     console.print("[dim](Milestone 4 LLM loop will live here while DuckDB remains open.)[/dim]\n")
 
 
-def run_triage(base_output: Path):
+def run_triage(base_output: Path, main_directory: Path | None = None):
     with duckdb.connect(":memory:") as con:
         con.execute("SET memory_limit = '2GB';")
 
@@ -81,4 +81,4 @@ def run_triage(base_output: Path):
             else:
                 console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
 
-        llm_cli.start_cli(con, mounted_views, base_output)
+        llm_cli.start_cli(con, mounted_views, base_output, main_directory=main_directory)

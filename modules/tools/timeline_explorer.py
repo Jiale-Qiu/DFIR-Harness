@@ -30,41 +30,61 @@ def _find_timeline_explorer() -> Path | None:
     return None
 
 
-def _resolve_csv_files(base_output: Path, artifacts: list[str], files: list[str]) -> list[Path]:
-    """Resolves requested artifact categories and/or specific CSV filenames inside base_output."""
+def _resolve_csv_files(
+    base_output: Path,
+    artifacts: list[str],
+    files: list[str],
+    main_directory: Path | None = None,
+) -> list[Path]:
+    """Resolves requested artifact categories and/or specific CSV filenames inside base_output or main_directory."""
     resolved: list[Path] = []
     seen: set[Path] = set()
+    base_resolved = base_output.resolve()
+    main_resolved = main_directory.resolve() if main_directory is not None else None
+    search_roots = [base_resolved] + ([main_resolved] if main_resolved and main_resolved != base_resolved else [])
 
-    def _add(p: Path):
+    def _is_confined(p_res: Path) -> bool:
+        return any(p_res.is_relative_to(root) for root in search_roots)
+
+    def _add(p: Path) -> bool:
         p_res = p.resolve()
-        if p_res.is_file() and p_res.suffix.lower() == ".csv" and p_res not in seen:
+        if _is_confined(p_res) and p_res.is_file() and p_res.suffix.lower() == ".csv" and p_res not in seen:
             seen.add(p_res)
             resolved.append(p_res)
+            return True
+        return False
 
     for name in artifacts:
         key = name.strip().lower()
         if key in ARTIFACT_SOURCES:
             sub, pattern = ARTIFACT_SOURCES[key]
-            for f in sorted((base_output / sub).glob(pattern)):
+            for f in sorted((base_resolved / sub).glob(pattern)):
                 if f.stat().st_size > 0:
                     _add(f)
 
     for rel in files:
         candidate = Path(rel)
-        if not candidate.is_absolute():
-            candidate = base_output / rel
-        if candidate.is_file():
+        if candidate.is_absolute():
             _add(candidate)
-        else:
-            # Fallback: match by basename anywhere under base_output
-            for match in sorted(base_output.rglob(Path(rel).name)):
-                _add(match)
+            continue
+
+        matched = False
+        for root in search_roots:
+            if _add(root / rel):
+                matched = True
+                break
+        if not matched:
+            for root in search_roots:
+                for match in sorted(root.rglob(candidate.name)):
+                    _add(match)
 
     return resolved
 
 
 def _handle_open_gui(args: dict, ctx: dict) -> dict:
     base_output = Path(ctx["base_output"])
+    raw_main = ctx.get("main_directory")
+    main_directory = Path(raw_main) if raw_main else None
     artifacts = args.get("artifacts") or []
     files = args.get("files") or []
     reason = args.get("reason", "Open parsed CSVs for manual analyst review")
@@ -78,14 +98,21 @@ def _handle_open_gui(args: dict, ctx: dict) -> dict:
         console.print(f"[red][!] {msg}[/red]")
         return {"error": msg}
 
-    targets = _resolve_csv_files(base_output, artifacts, files)
+    targets = _resolve_csv_files(base_output, artifacts, files, main_directory=main_directory)
     if not targets:
-        return {"error": f"No matching non-empty CSV files found in {base_output}."}
+        return {"error": "No matching non-empty CSV files found in case directories."}
 
+    base_resolved = base_output.resolve()
+    main_resolved = main_directory.resolve() if main_directory else None
     preview_lines = [f"Reason: {reason}"]
     for p in targets:
         size_mb = p.stat().st_size / (1024 * 1024)
-        rel_display = p.relative_to(base_output.resolve()) if p.is_relative_to(base_output.resolve()) else p
+        if p.is_relative_to(base_resolved):
+            rel_display = f"[output] {p.relative_to(base_resolved).as_posix()}"
+        elif main_resolved and p.is_relative_to(main_resolved):
+            rel_display = f"[source] {p.relative_to(main_resolved).as_posix()}"
+        else:
+            rel_display = str(p)
         warn = " [LARGE - may use heavy RAM]" if size_mb > 150 else ""
         preview_lines.append(f"- {rel_display} ({size_mb:.2f} MB){warn}")
 
@@ -129,7 +156,10 @@ REGISTER = [
                         "files": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional specific CSV filenames or relative paths inside the parsed output folder.",
+                            "description": (
+                                "Optional specific CSV filenames or relative paths inside the parsed output folder "
+                                "or source investigation directory."
+                            ),
                         },
                     },
                     "required": ["reason"],

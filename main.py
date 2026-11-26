@@ -108,7 +108,7 @@ def main():
             PARSERS[category](file_list, category_out, dry_run=args.dry_run)
 
     if not args.dry_run:
-        triage.run_triage(base_output)
+        triage.run_triage(base_output, main_directory=main_directory)
 
 if __name__ == "__main__":
     main()

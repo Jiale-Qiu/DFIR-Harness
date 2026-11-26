@@ -60,9 +60,9 @@ def _format_bytes(size: int) -> str:
     return f"{size:.1f} GB"
 
 
-def _build_directory_tree(base_output: Path, max_entries: int = 120, max_depth: int = 4) -> str:
-    """Builds a bounded indented tree of all files/folders in base_output."""
-    lines: list[str] = [f"{base_output.name}/"]
+def _build_directory_tree(root_dir: Path, max_entries: int = 120, max_depth: int = 4) -> str:
+    """Builds a bounded indented tree of all files/folders in root_dir."""
+    lines: list[str] = [f"{root_dir.name}/"]
     count = 0
     truncated = False
 
@@ -94,19 +94,41 @@ def _build_directory_tree(base_output: Path, max_entries: int = 120, max_depth: 
                     sz = "?"
                 lines.append(f"{indent}{entry.name} ({sz})")
 
-    _walk(base_output, 1)
+    _walk(root_dir, 1)
     if truncated:
         lines.append(f"... (tree capped at {max_entries} entries — use list_directory for specific folders)")
     return "\n".join(lines)
 
 
-def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
-    """Builds the DFIR system prompt grounded in live DuckDB schemas, file tree, and triage output."""
+def _build_system_prompt(
+    schemas: dict[str, dict],
+    base_output: Path,
+    main_directory: Path | None = None,
+) -> str:
+    """Builds the DFIR system prompt grounded in live DuckDB schemas, file trees, and triage output."""
     schema_lines = [
         f"- `{view}` ({info['rows']:,} rows): {', '.join(info['columns'])}"
         for view, info in schemas.items()
     ]
-    dir_tree = _build_directory_tree(base_output)
+    base_resolved = base_output.resolve()
+    output_tree = _build_directory_tree(base_resolved)
+
+    source_section = ""
+    if main_directory is not None:
+        main_resolved = main_directory.resolve()
+        if main_resolved == base_resolved:
+            source_section = (
+                f"### Source Investigation Directory (`root=\"source\"`)\n"
+                f"Same as the parsed output directory (`{main_resolved}`).\n\n"
+            )
+        elif main_resolved.is_dir():
+            source_tree = _build_directory_tree(main_resolved)
+            source_section = (
+                f"### Source Investigation Directory Tree (`root=\"source\"`, {main_resolved})\n"
+                f"Raw/unparsed case artifacts in the selected investigation directory:\n```\n"
+                + source_tree
+                + "\n```\n\n"
+            )
 
     triage_block = ""
     summary_path = base_output / "triage_summary.json"
@@ -126,8 +148,10 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
         "or open Timeline Explorer when the analyst wants to inspect raw CSVs visually.\n\n"
         "### Mounted DuckDB Views & Columns\n"
         + "\n".join(schema_lines)
-        + "\n\n### Case Directory Tree\n```\n"
-        + dir_tree
+        + "\n\n"
+        + source_section
+        + f"### Parsed Output Directory Tree (`root=\"output\"`, {base_resolved})\n```\n"
+        + output_tree
         + "\n```\n\n### Critical Tool & Query Rules\n"
         "1. Every DuckDB view was mounted with `all_varchar=true` — ALL columns are VARCHAR strings.\n"
         "   - Compare IDs as strings (e.g., `EventId = '4624'`).\n"
@@ -137,12 +161,15 @@ def _build_system_prompt(schemas: dict[str, dict], base_output: Path) -> str:
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
         "5. File Inspection (`read_file` / `list_directory`): Use `read_file` to inspect logs, scripts, JSON, "
-        "or unmounted text artifacts. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
+        "or unmounted text artifacts in either the source investigation directory (`root=\"source\"`) or the "
+        "parsed output directory (`root=\"output\"`). Prefer specifying `root` explicitly when a folder name "
+        "exists in both trees. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
         "slices rather than trying to read whole files. Never use `read_file` on large CSVs that are already "
         "mounted in DuckDB.\n"
         "6. Terminal Execution (`run_terminal`) — STRICT LAST RESORT ONLY: Only propose a terminal command "
         "when NO other registered tool (DuckDB SQL, `read_file`, `list_directory`, decoders, etc.) can complete "
-        "the task. Always state in `reason` why built-in tools cannot do it, and keep commands read-only and output-bounded.\n"
+        "the task. Always state in `reason` why built-in tools cannot do it, set `root` (`\"output\"` or "
+        "`\"source\"`) if needed, and keep commands read-only and output-bounded.\n"
         "7. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
@@ -344,7 +371,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     return False
 
 
-def start_cli(con, mounted_views: set[str], base_output: Path):
+def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: Path | None = None):
     """Interactive DFIR investigation CLI with DuckDB schema grounding and HITL tool execution."""
     api_key = os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("LLM_MODEL")
@@ -361,10 +388,13 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
     active_tools = list_tools()
     client = OpenAI()
     pane_path = get_session_state_path()
+    base_path = Path(base_output)
+    main_path = Path(main_directory) if main_directory is not None else None
     ctx = {
         "con": con,
         "mounted_views": mounted_views,
-        "base_output": Path(base_output),
+        "base_output": base_path,
+        "main_directory": main_path,
         "state": {
             "reasoning": DEFAULT_REASONING,
             "thinking_mode": DEFAULT_THINKING_MODE,
@@ -373,7 +403,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
             "pane_path": pane_path,
         },
     }
-    messages = [{"role": "system", "content": _build_system_prompt(schemas, Path(base_output))}]
+    messages = [{"role": "system", "content": _build_system_prompt(schemas, base_path, main_path)}]
 
     console.print("\n[bold cyan]=== LLM Investigation CLI ===[/bold cyan]")
     console.print(

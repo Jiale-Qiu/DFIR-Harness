@@ -1,4 +1,4 @@
-"""Safe, context-bounded file inspection tools confined to the case output directory."""
+"""Safe, context-bounded file inspection tools confined to case directories."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ MAX_RETURN_CHARS = 12_000
 MAX_SINGLE_LINE_CHARS = 500
 MAX_LIST_ENTRIES = 100
 LARGE_CSV_WARN_BYTES = 256 * 1024  # 256 KB
+VALID_ROOTS = ("auto", "output", "source")
 
 
 def _format_size(size: int) -> str:
@@ -22,8 +23,8 @@ def _format_size(size: int) -> str:
     return f"{size:.1f} GB"
 
 
-def _resolve_confined(base_output: Path, rel_path: str) -> tuple[Path | None, str | None]:
-    base_resolved = base_output.resolve()
+def _resolve_confined(root_dir: Path, rel_path: str) -> tuple[Path | None, str | None]:
+    base_resolved = root_dir.resolve()
     raw = (rel_path or ".").strip()
     candidate = Path(raw)
     target = candidate.resolve() if candidate.is_absolute() else (base_resolved / candidate).resolve()
@@ -31,6 +32,61 @@ def _resolve_confined(base_output: Path, rel_path: str) -> tuple[Path | None, st
     if not target.is_relative_to(base_resolved):
         return None, "Access denied: path escapes the case directory."
     return target, None
+
+
+def _resolve_target(
+    ctx: dict, rel_path: str, root: str | None = None
+) -> tuple[Path | None, str | None, Path | None, str | None, str | None]:
+    """Resolves a path inside the parsed output ('output') or source investigation ('source') root."""
+    requested_root = (root or "auto").strip().lower()
+    if requested_root not in VALID_ROOTS:
+        return None, None, None, None, f"Invalid root '{root}'. Use 'output', 'source', or 'auto'."
+
+    base_output = Path(ctx["base_output"]).resolve()
+    raw_main = ctx.get("main_directory")
+    main_dir = Path(raw_main).resolve() if raw_main else None
+
+    if requested_root == "output":
+        target, err = _resolve_confined(base_output, rel_path)
+        return target, "output", base_output, None, err
+
+    if requested_root == "source":
+        if main_dir is None:
+            return None, None, None, None, "Source investigation directory is not configured."
+        target, err = _resolve_confined(main_dir, rel_path)
+        return target, "source", main_dir, None, err
+
+    raw = (rel_path or ".").strip()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if resolved.is_relative_to(base_output):
+            return resolved, "output", base_output, None, None
+        if main_dir is not None and resolved.is_relative_to(main_dir):
+            return resolved, "source", main_dir, None, None
+        return None, None, None, None, "Access denied: path escapes the case directories."
+
+    out_target, out_err = _resolve_confined(base_output, raw)
+    if out_err:
+        return None, None, None, None, out_err
+
+    if main_dir is not None:
+        src_target, src_err = _resolve_confined(main_dir, raw)
+        if src_err:
+            return None, None, None, None, src_err
+
+        out_exists = out_target.exists()
+        src_exists = src_target is not None and src_target.exists()
+        if out_exists and src_exists and out_target != src_target:
+            note = (
+                "A matching path also exists in root='source'. "
+                "Pass root='source' to inspect the source investigation directory."
+            )
+            return out_target, "output", base_output, note, None
+        if not out_exists and src_exists:
+            return src_target, "source", main_dir, None, None
+
+    return out_target, "output", base_output, None, None
 
 
 def _is_binary_file(path: Path) -> bool:
@@ -51,14 +107,14 @@ def _is_binary_file(path: Path) -> bool:
 
 
 def _read_file(args: dict, ctx: dict) -> dict:
-    base_output = Path(ctx["base_output"])
     rel_path = args.get("path", "")
+    root = args.get("root")
     reason = args.get("reason", "Inspect file contents")
     start_line = max(1, int(args.get("start_line") or 1))
     max_lines = max(1, min(MAX_LINES_CAP, int(args.get("max_lines") or DEFAULT_MAX_LINES)))
     search = (args.get("search") or "").strip()
 
-    target, err = _resolve_confined(base_output, rel_path)
+    target, root_name, root_dir, root_note, err = _resolve_target(ctx, rel_path, root)
     if err:
         return {"error": err}
     if not target.exists():
@@ -75,9 +131,9 @@ def _read_file(args: dict, ctx: dict) -> dict:
             )
         }
 
-    display_rel = target.relative_to(base_output.resolve()).as_posix()
+    display_rel = target.relative_to(root_dir).as_posix()
     details = [
-        f"File: {display_rel} ({_format_size(size_bytes)})",
+        f"File: [{root_name}] {display_rel} ({_format_size(size_bytes)})",
         f"Slice: lines {start_line}..{start_line + max_lines - 1} (cap: {MAX_RETURN_CHARS:,} chars)",
         f"Reason: {reason}",
     ]
@@ -123,6 +179,7 @@ def _read_file(args: dict, ctx: dict) -> dict:
         return {"error": f"Failed to read file: {e}"}
 
     result = {
+        "root": root_name,
         "path": display_rel,
         "size": _format_size(size_bytes),
         "start_line": start_line,
@@ -134,15 +191,21 @@ def _read_file(args: dict, ctx: dict) -> dict:
     }
     if has_more and collected:
         result["next_start_line"] = last_line_seen + 1
+
+    notes = []
+    if root_note:
+        notes.append(root_note)
     if target.suffix.lower() == ".csv" and size_bytes > LARGE_CSV_WARN_BYTES:
-        result["note"] = "Large CSV file — prefer DuckDB SQL if this artifact is mounted as a view."
+        notes.append("Large CSV file — prefer DuckDB SQL if this artifact is mounted as a view.")
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 
 def _list_directory(args: dict, ctx: dict) -> dict:
-    base_output = Path(ctx["base_output"])
     rel_path = args.get("path", ".")
-    target, err = _resolve_confined(base_output, rel_path)
+    root = args.get("root")
+    target, root_name, root_dir, root_note, err = _resolve_target(ctx, rel_path, root)
     if err:
         return {"error": err}
     if not target.exists() or not target.is_dir():
@@ -160,12 +223,16 @@ def _list_directory(args: dict, ctx: dict) -> dict:
                 sz = "?"
             items.append({"name": entry.name, "type": "file", "size": sz})
 
-    return {
-        "path": target.relative_to(base_output.resolve()).as_posix(),
+    result = {
+        "root": root_name,
+        "path": target.relative_to(root_dir).as_posix(),
         "total_entries": len(entries),
         "truncated": len(entries) > MAX_LIST_ENTRIES,
         "entries": items,
     }
+    if root_note:
+        result["note"] = root_note
+    return result
 
 
 REGISTER = [
@@ -175,7 +242,8 @@ REGISTER = [
             "function": {
                 "name": "read_file",
                 "description": (
-                    "Request analyst approval to safely read a bounded slice of a text file inside the case directory. "
+                    "Request analyst approval to safely read a bounded slice of a text file inside either the "
+                    "source investigation directory (root='source') or the parsed output directory (root='output'). "
                     "Large files are strictly paginated and capped to protect the context window. "
                     "For large CSVs already mounted in DuckDB, prefer SQL queries instead of read_file."
                 ),
@@ -184,7 +252,16 @@ REGISTER = [
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path from the case directory (as shown in the directory tree).",
+                            "description": "Relative path from the chosen root directory (as shown in the directory tree).",
+                        },
+                        "root": {
+                            "type": "string",
+                            "enum": ["auto", "output", "source"],
+                            "description": (
+                                "Which directory tree to read from: 'source' for the selected investigation directory, "
+                                "'output' for the parsed output directory, or 'auto' (default) to check 'output' then 'source'."
+                            ),
+                            "default": "auto",
                         },
                         "reason": {
                             "type": "string",
@@ -217,17 +294,26 @@ REGISTER = [
             "function": {
                 "name": "list_directory",
                 "description": (
-                    "List files and subdirectories inside a specific folder of the case directory "
-                    "(useful when the initial directory tree was truncated)."
+                    "List files and subdirectories inside a specific folder of either the source investigation "
+                    "directory (root='source') or the parsed output directory (root='output')."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative directory path inside the case folder (default: '.').",
+                            "description": "Relative directory path inside the chosen root folder (default: '.').",
                             "default": ".",
-                        }
+                        },
+                        "root": {
+                            "type": "string",
+                            "enum": ["auto", "output", "source"],
+                            "description": (
+                                "Which directory tree to list: 'source' for the selected investigation directory, "
+                                "'output' for the parsed output directory, or 'auto' (default)."
+                            ),
+                            "default": "auto",
+                        },
                     },
                 },
             },

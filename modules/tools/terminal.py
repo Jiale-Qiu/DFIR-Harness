@@ -22,11 +22,20 @@ def _cap(text: str, limit: int) -> tuple[str, bool]:
 def _run_terminal(args: dict, ctx: dict) -> dict:
     command = (args.get("command") or "").strip()
     reason = (args.get("reason") or "").strip()
+    root = (args.get("root") or "output").strip().lower()
     if not command:
         return {"error": "Empty command."}
 
     timeout = max(5, min(MAX_TIMEOUT_SEC, int(args.get("timeout") or DEFAULT_TIMEOUT_SEC)))
-    cwd = Path(ctx["base_output"]).resolve()
+    if root == "source":
+        raw_main = ctx.get("main_directory")
+        if not raw_main:
+            return {"error": "Source investigation directory is not configured."}
+        cwd = Path(raw_main).resolve()
+    elif root == "output":
+        cwd = Path(ctx["base_output"]).resolve()
+    else:
+        return {"error": f"Invalid root '{root}'. Use 'output' or 'source'."}
 
     # Always require explicit analyst approval — intentionally ignores auto_sql or any auto-accept flags.
     if not confirm_terminal(reason=reason, command=command, cwd=str(cwd)):
@@ -81,7 +90,16 @@ REGISTER = [
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The exact shell command to run inside the case directory.",
+                            "description": "The exact shell command to run inside the selected case directory.",
+                        },
+                        "root": {
+                            "type": "string",
+                            "enum": ["output", "source"],
+                            "description": (
+                                "Which directory to use as the working directory: 'output' for the parsed output "
+                                "folder (default) or 'source' for the selected investigation directory."
+                            ),
+                            "default": "output",
                         },
                         "reason": {
                             "type": "string",
