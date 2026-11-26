@@ -1,5 +1,6 @@
 import subprocess
 from rich.console import Console
+from rich.progress import track
 
 console = Console(highlight=False)
 
@@ -8,8 +9,9 @@ def parse(file_list, out_dir, dry_run=False):
     out_str = str(out_dir)
     failed = 0
 
-    for evtx_file in file_list:
-        # Explicit --csvf avoids timestamp filename collisions when multiple logs parse within the same second
+    items = file_list if dry_run else track(file_list, description="[cyan]Parsing EVTX logs...[/cyan]", console=console)
+
+    for evtx_file in items:
         csv_name = f"{evtx_file.stem}.csv"
         cmd = ["EvtxECmd.exe", "-f", str(evtx_file), "--csv", out_str, "--csvf", csv_name]
 

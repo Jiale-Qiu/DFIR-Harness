@@ -6,8 +6,6 @@ console = Console(highlight=False)
 def parse(file_list, out_dir, dry_run=False):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_str = str(out_dir)
-
-    # Group discovered .pf files by their parent directory (usually just Windows\Prefetch)
     target_dirs = sorted({pf.parent for pf in file_list})
     failed = 0
 
@@ -18,7 +16,9 @@ def parse(file_list, out_dir, dry_run=False):
             console.print(f"    [DRY-RUN] {' '.join(cmd)}")
             continue
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Plays the bouncing bar animation until subprocess.run() finishes
+        with console.status(f"[cyan]Parsing {len(file_list)} Prefetch files...[/cyan]", spinner="aesthetic"):
+            result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
             failed += 1
