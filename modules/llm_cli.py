@@ -1,24 +1,34 @@
+"""
+NVIDIA NIM (paste the exact model ID shown on the NIM page)
+$env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
+$env:OPENAI_API_KEY="nvapi-your-key-here"
+$env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
+
+# Or switch to Groq in the same terminal
+$env:OPENAI_BASE_URL="https://api.groq.com/openai/v1"
+$env:OPENAI_API_KEY="gsk_your-key-here"
+$env:LLM_MODEL="llama-3.3-70b-versatile"
+"""
+
 import os
 from openai import OpenAI
 from rich.console import Console
 
 console = Console(highlight=False)
 
-MODEL = "moonshotai/kimi-k3.1-pro"
-BASE_URL = "https://integrate.api.nvidia.com/v1"
-
 
 def start_cli(con, mounted_views: set[str], base_output):
-    """Minimal interactive chat loop with NVIDIA NIM."""
-    api_key = os.environ.get("NVIDIA_API_KEY")
-    if not api_key:
-        console.print("[red][!] NVIDIA_API_KEY not found in environment variables.[/red]")
-        console.print("    If you just ran setx, close and reopen your terminal first.")
+    """Minimal interactive chat loop configured purely via environment variables."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    model = os.environ.get("LLM_MODEL")
+
+    if not api_key or not model:
+        console.print("[red][!] Missing config. Set OPENAI_API_KEY, OPENAI_BASE_URL, and LLM_MODEL.[/red]")
         return
 
-    client = OpenAI(base_url=BASE_URL, api_key=api_key)
+    # OpenAI() automatically reads OPENAI_API_KEY and OPENAI_BASE_URL from the environment
+    client = OpenAI()
 
-    # Conversation history sent with each request so the model remembers context
     messages = [
         {
             "role": "system",
@@ -27,7 +37,7 @@ def start_cli(con, mounted_views: set[str], base_output):
     ]
 
     console.print("\n[bold cyan]=== LLM Investigation CLI ===[/bold cyan]")
-    console.print(f"[dim]Model: {MODEL} | Type 'exit' or 'quit' to leave.[/dim]\n")
+    console.print(f"[dim]Model: {model} | Type 'exit' to leave.[/dim]\n")
 
     while True:
         try:
@@ -47,7 +57,7 @@ def start_cli(con, mounted_views: set[str], base_output):
         try:
             with console.status("[cyan]Thinking...[/cyan]", spinner="dots"):
                 response = client.chat.completions.create(
-                    model=MODEL,
+                    model=model,
                     messages=messages,
                     temperature=0.6,
                     max_tokens=1024,
@@ -59,4 +69,4 @@ def start_cli(con, mounted_views: set[str], base_output):
 
         except Exception as e:
             console.print(f"\n[red][!] API Error: {e}[/red]\n")
-            messages.pop()  # Drop the failed prompt so message history stays clean
+            messages.pop()
