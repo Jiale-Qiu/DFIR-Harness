@@ -1,11 +1,11 @@
 """
 # NVIDIA NIM
-$env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
+$env:OPENAI_BASE_URL="[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)"
 $env:OPENAI_API_KEY="nvapi-your-key-here"
 $env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
 
 # Or switch to Groq in the same terminal
-$env:OPENAI_BASE_URL="https://api.groq.com/openai/v1"
+$env:OPENAI_BASE_URL="[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)"
 $env:OPENAI_API_KEY="gsk_your-key-here"
 $env:LLM_MODEL="llama-3.3-70b-versatile"
 """
@@ -16,10 +16,15 @@ from pathlib import Path
 
 import duckdb
 from openai import OpenAI
-from rich.live import Live
 from rich.table import Table
 
 from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
+from modules.pane_bridge import (
+    clear_result_pane,
+    get_session_state_path,
+    open_result_pane,
+    publish_result,
+)
 from modules.tools import TOOL_SCHEMAS, execute_tool, list_tools
 from modules.tools.duckdb_sql import execute_sql
 
@@ -119,13 +124,12 @@ def _stream_completion(
     if state["reasoning"] != "off":
         request_kwargs["extra_body"] = {"reasoning_effort": state["reasoning"]}
 
-    renderer = StreamRenderer(state["reasoning"], state["thinking_mode"])
     answer_chunks: list[str] = []
     tool_calls_acc: dict[int, dict] = {}
     finish_reason = None
 
     console.print()
-    with Live(renderer, console=console, refresh_per_second=12, vertical_overflow="visible") as live:
+    with StreamRenderer(state["reasoning"], state["thinking_mode"]) as renderer:
         stream = client.chat.completions.create(**request_kwargs)
         for chunk in stream:
             if not chunk.choices:
@@ -159,9 +163,6 @@ def _stream_completion(
                         if tc.function.arguments:
                             entry["function"]["arguments"] += tc.function.arguments
 
-        renderer.stop_spinner()
-        live.refresh()
-
     print()
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
     return "".join(answer_chunks), tool_calls, finish_reason
@@ -176,6 +177,20 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
 
     if cmd_lower in ("/help", "/?"):
         print_help()
+        return True
+
+    if cmd_lower == "/pane":
+        if arg.lower() == "off":
+            state["pane_open"] = False
+            console.print("[cyan][*] Switched /show and /sql back to inline mode.[/cyan]\n")
+            return True
+        if open_result_pane(state["pane_path"]):
+            state["pane_open"] = True
+            if state["history"]:
+                publish_result(state["pane_path"], state["history"][-1])
+            console.print("[cyan][*] Opened right-side query viewer pane (Ctrl+Shift+W in pane to close; '/pane off' for inline).[/cyan]\n")
+        else:
+            console.print("[yellow][!] /pane requires Windows Terminal.[/yellow]\n")
         return True
 
     if cmd_lower == "/reasoning":
@@ -205,15 +220,25 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
                 console.print(f"[yellow][!] Valid query range: 1..{len(history)}[/yellow]\n")
                 return True
             idx = int(arg) - 1
-        print_result_table(history[idx])
-        print()
+
+        entry = history[idx]
+        publish_result(state["pane_path"], entry)
+        if state["pane_open"]:
+            qid = entry.get("id") or (idx + 1)
+            console.print(f"[cyan][*] Displayed Query #{qid} in right pane.[/cyan]\n")
+        else:
+            print_result_table(entry)
+            print()
         return True
 
     if cmd_lower == "/sql":
         if not arg:
             console.print("[yellow][!] Usage: /sql SELECT * FROM evtx LIMIT 5[/yellow]\n")
         else:
-            execute_sql(ctx["con"], arg, state["history"], show_table=True)
+            prev_len = len(state["history"])
+            execute_sql(ctx["con"], arg, state["history"], show_table=not state["pane_open"])
+            if len(state["history"]) > prev_len:
+                publish_result(state["pane_path"], state["history"][-1])
             print()
         return True
 
@@ -235,6 +260,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     if cmd_lower == "/clear":
         del messages[1:]
         state["history"].clear()
+        clear_result_pane(state["pane_path"])
         console.print("[cyan][*] Conversation and query cache cleared.[/cyan]\n")
         return True
 
@@ -257,6 +283,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
 
     active_tools = list_tools()
     client = OpenAI()
+    pane_path = get_session_state_path()
     ctx = {
         "con": con,
         "mounted_views": mounted_views,
@@ -265,6 +292,8 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
             "reasoning": DEFAULT_REASONING,
             "thinking_mode": DEFAULT_THINKING_MODE,
             "history": [],
+            "pane_path": pane_path,
+            "pane_open": False,
         },
     }
     messages = [{"role": "system", "content": _build_system_prompt(schemas, Path(base_output))}]
@@ -272,62 +301,68 @@ def start_cli(con, mounted_views: set[str], base_output: Path):
     console.print("\n[bold cyan]=== LLM Investigation CLI ===[/bold cyan]")
     console.print(
         f"[dim]Model: {model} | Views: {', '.join(sorted(schemas))} | "
-        f"Tools: {len(active_tools)} loaded | Type /help for commands[/dim]\n"
+        f"Tools: {len(active_tools)} loaded | Type /pane for split viewer or /help for commands[/dim]\n"
     )
 
-    while True:
-        try:
-            user_input = input("You > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[yellow][-] Exiting LLM CLI.[/yellow]")
-            break
+    try:
+        while True:
+            try:
+                user_input = input("You > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow][-] Exiting LLM CLI.[/yellow]")
+                break
 
-        if not user_input:
-            continue
-        if user_input.lower() in ("exit", "quit", "/q"):
-            console.print("[yellow][-] Exiting LLM CLI.[/yellow]")
-            break
-        if user_input.startswith("/") and _handle_slash_command(user_input, ctx, schemas, messages):
-            continue
+            if not user_input:
+                continue
+            if user_input.lower() in ("exit", "quit", "/q"):
+                console.print("[yellow][-] Exiting LLM CLI.[/yellow]")
+                break
+            if user_input.startswith("/") and _handle_slash_command(user_input, ctx, schemas, messages):
+                continue
 
-        turn_start_idx = len(messages)
-        messages.append({"role": "user", "content": user_input})
+            turn_start_idx = len(messages)
+            messages.append({"role": "user", "content": user_input})
 
-        try:
-            for round_idx in range(MAX_TOOL_ROUNDS):
-                # Reserve the final round for synthesis so the turn never ends without a summary
-                allow_tools = round_idx < (MAX_TOOL_ROUNDS - 1)
-                reply, tool_calls, finish_reason = _stream_completion(
-                    client, model, messages, ctx["state"], allow_tools=allow_tools
-                )
-
-                if finish_reason == "length":
-                    console.print("[yellow][!] Response hit max_tokens (4096) and was cut short.[/yellow]\n")
-
-                if not tool_calls:
-                    if reply:
-                        messages.append({"role": "assistant", "content": reply})
-                    else:
-                        del messages[turn_start_idx:]
-                    break
-
-                messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
-
-                for tc in tool_calls:
-                    result = execute_tool(tc["function"]["name"], tc["function"]["arguments"], ctx)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": json.dumps(result, ensure_ascii=False),
-                        }
+            try:
+                for round_idx in range(MAX_TOOL_ROUNDS):
+                    # Reserve the final round for synthesis so the turn never ends without a summary
+                    allow_tools = round_idx < (MAX_TOOL_ROUNDS - 1)
+                    reply, tool_calls, finish_reason = _stream_completion(
+                        client, model, messages, ctx["state"], allow_tools=allow_tools
                     )
-            else:
-                console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
 
-        except KeyboardInterrupt:
-            console.print("\n[yellow][-] Generation interrupted.[/yellow]\n")
-            del messages[turn_start_idx:]
-        except Exception as e:
-            console.print(f"\n[red][!] API Error: {e}[/red]\n")
-            del messages[turn_start_idx:]
+                    if finish_reason == "length":
+                        console.print("[yellow][!] Response hit max_tokens (4096) and was cut short.[/yellow]\n")
+
+                    if not tool_calls:
+                        if reply:
+                            messages.append({"role": "assistant", "content": reply})
+                        else:
+                            del messages[turn_start_idx:]
+                        break
+
+                    messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
+
+                    for tc in tool_calls:
+                        prev_len = len(ctx["state"]["history"])
+                        result = execute_tool(tc["function"]["name"], tc["function"]["arguments"], ctx)
+                        if len(ctx["state"]["history"]) > prev_len:
+                            publish_result(ctx["state"]["pane_path"], ctx["state"]["history"][-1])
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": json.dumps(result, ensure_ascii=False),
+                            }
+                        )
+                else:
+                    console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
+
+            except KeyboardInterrupt:
+                console.print("\n[yellow][-] Generation interrupted.[/yellow]\n")
+                del messages[turn_start_idx:]
+            except Exception as e:
+                console.print(f"\n[red][!] API Error: {e}[/red]\n")
+                del messages[turn_start_idx:]
+    finally:
+        pane_path.unlink(missing_ok=True)
