@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from modules.common import safe_int
 from modules.llm_ui import confirm_terminal
 
 DEFAULT_TIMEOUT_SEC = 30
@@ -13,20 +14,27 @@ MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
 
 
-def _cap(text: str, limit: int) -> tuple[str, bool]:
+def _decode_output(raw: str | bytes | None) -> str:
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw or ""
+
+
+def _cap(raw: str | bytes | None, limit: int) -> tuple[str, bool]:
+    text = _decode_output(raw)
     if len(text) <= limit:
         return text, False
     return text[:limit] + f"\n... [truncated {len(text) - limit:,} chars]", True
 
 
 def _run_terminal(args: dict, ctx: dict) -> dict:
-    command = (args.get("command") or "").strip()
-    reason = (args.get("reason") or "").strip()
-    root = (args.get("root") or "output").strip().lower()
+    command = str(args.get("command") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    root = str(args.get("root") or "output").strip().lower()
     if not command:
         return {"error": "Empty command."}
 
-    timeout = max(5, min(MAX_TIMEOUT_SEC, int(args.get("timeout") or DEFAULT_TIMEOUT_SEC)))
+    timeout = max(5, min(MAX_TIMEOUT_SEC, safe_int(args.get("timeout"), DEFAULT_TIMEOUT_SEC)))
     if root == "source":
         raw_main = ctx.get("main_directory")
         if not raw_main:
@@ -36,6 +44,9 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
         cwd = Path(ctx["base_output"]).resolve()
     else:
         return {"error": f"Invalid root '{root}'. Use 'output' or 'source'."}
+
+    if not cwd.is_dir():
+        return {"error": f"Working directory does not exist: {cwd}"}
 
     # Always require explicit analyst approval — intentionally ignores auto_sql or any auto-accept flags.
     if not confirm_terminal(reason=reason, command=command, cwd=str(cwd)):
@@ -53,8 +64,8 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        out, _ = _cap(exc.stdout or "", MAX_STDOUT_CHARS)
-        err, _ = _cap(exc.stderr or "", MAX_STDERR_CHARS)
+        out, _ = _cap(exc.stdout, MAX_STDOUT_CHARS)
+        err, _ = _cap(exc.stderr, MAX_STDERR_CHARS)
         return {
             "error": f"Command timed out after {timeout}s.",
             "stdout": out,
@@ -63,8 +74,8 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     except OSError as exc:
         return {"error": f"Failed to execute command: {exc}"}
 
-    stdout, out_trunc = _cap(proc.stdout or "", MAX_STDOUT_CHARS)
-    stderr, err_trunc = _cap(proc.stderr or "", MAX_STDERR_CHARS)
+    stdout, out_trunc = _cap(proc.stdout, MAX_STDOUT_CHARS)
+    stderr, err_trunc = _cap(proc.stderr, MAX_STDERR_CHARS)
     return {
         "exit_code": proc.returncode,
         "stdout": stdout,

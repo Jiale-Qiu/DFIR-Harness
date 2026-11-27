@@ -52,13 +52,18 @@ def is_pane_alive(state_path: Path) -> bool:
 
 def _write_json_atomic(state_path: Path, payload: dict) -> None:
     tmp_path = state_path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    for _ in range(4):
-        try:
-            os.replace(tmp_path, state_path)
-            return
-        except PermissionError:
-            time.sleep(0.03)
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        for _ in range(4):
+            try:
+                os.replace(tmp_path, state_path)
+                return
+            except PermissionError:
+                time.sleep(0.03)
+    except OSError:
+        pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _format_entry(entry: dict) -> dict:
@@ -106,27 +111,28 @@ def open_result_pane(
         ";", "move-focus", "left",
     ]
     _launch_times[state_path] = time.monotonic()
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        _launch_times.pop(state_path, None)
+        return "unsupported"
     return "opened"
 
 
 def publish_result(state_path: Path, entry: dict) -> None:
     """Writes a history entry dict if the right pane is active."""
-    if not is_pane_alive(state_path):
-        return
-    _write_json_atomic(state_path, _format_entry(entry))
+    if is_pane_alive(state_path):
+        _write_json_atomic(state_path, _format_entry(entry))
 
 
 def clear_result_pane(state_path: Path) -> None:
     """Resets the right pane back to its waiting state if open."""
-    if not is_pane_alive(state_path):
-        return
-    _write_json_atomic(state_path, {"cleared": True})
+    if is_pane_alive(state_path):
+        _write_json_atomic(state_path, {"cleared": True})
 
 
 def close_result_pane(state_path: Path) -> None:
     """Signals the right pane to exit cleanly and removes temp state files."""
     _launch_times.pop(state_path, None)
-    state_path.unlink(missing_ok=True)
-    state_path.with_suffix(".tmp").unlink(missing_ok=True)
-    _pid_path(state_path).unlink(missing_ok=True)
+    for path in (state_path, state_path.with_suffix(".tmp"), _pid_path(state_path)):
+        path.unlink(missing_ok=True)

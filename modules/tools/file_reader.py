@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from modules.common import format_bytes, safe_int
 from modules.llm_ui import confirm_action
 
 MAX_LINES_CAP = 200
@@ -13,14 +14,6 @@ MAX_SINGLE_LINE_CHARS = 500
 MAX_LIST_ENTRIES = 100
 LARGE_CSV_WARN_BYTES = 256 * 1024  # 256 KB
 VALID_ROOTS = ("auto", "output", "source")
-
-
-def _format_size(size: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
-        size /= 1024
-    return f"{size:.1f} GB"
 
 
 def _resolve_confined(root_dir: Path, rel_path: str) -> tuple[Path | None, str | None]:
@@ -75,7 +68,7 @@ def _resolve_target(
         if src_err:
             return None, None, None, None, src_err
 
-        out_exists = out_target.exists()
+        out_exists = out_target is not None and out_target.exists()
         src_exists = src_target is not None and src_target.exists()
         if out_exists and src_exists and out_target != src_target:
             note = (
@@ -91,9 +84,11 @@ def _resolve_target(
 
 def _is_binary_file(path: Path) -> bool:
     try:
-        sample = path.open("rb").read(4096)
+        with path.open("rb") as fh:
+            sample = fh.read(4096)
     except OSError:
         return True
+
     if not sample:
         return False
     if b"\x00" in sample:
@@ -107,16 +102,16 @@ def _is_binary_file(path: Path) -> bool:
 
 
 def _read_file(args: dict, ctx: dict) -> dict:
-    rel_path = args.get("path", "")
+    rel_path = str(args.get("path") or "")
     root = args.get("root")
-    reason = args.get("reason", "Inspect file contents")
-    start_line = max(1, int(args.get("start_line") or 1))
-    max_lines = max(1, min(MAX_LINES_CAP, int(args.get("max_lines") or DEFAULT_MAX_LINES)))
-    search = (args.get("search") or "").strip()
+    reason = (args.get("reason") or "Inspect file contents").strip()
+    start_line = max(1, safe_int(args.get("start_line"), 1))
+    max_lines = max(1, min(MAX_LINES_CAP, safe_int(args.get("max_lines"), DEFAULT_MAX_LINES)))
+    search = str(args.get("search") or "").strip()
 
     target, root_name, root_dir, root_note, err = _resolve_target(ctx, rel_path, root)
-    if err:
-        return {"error": err}
+    if err or target is None or root_dir is None:
+        return {"error": err or "Could not resolve path."}
     if not target.exists():
         return {"error": f"File not found: {rel_path}"}
     if not target.is_file():
@@ -126,14 +121,14 @@ def _read_file(args: dict, ctx: dict) -> dict:
     if _is_binary_file(target):
         return {
             "error": (
-                f"'{rel_path}' appears to be a binary file ({_format_size(size_bytes)}). "
+                f"'{rel_path}' appears to be a binary file ({format_bytes(size_bytes)}). "
                 "read_file only supports text files."
             )
         }
 
     display_rel = target.relative_to(root_dir).as_posix()
     details = [
-        f"File: [{root_name}] {display_rel} ({_format_size(size_bytes)})",
+        f"File: [{root_name}] {display_rel} ({format_bytes(size_bytes)})",
         f"Slice: lines {start_line}..{start_line + max_lines - 1} (cap: {MAX_RETURN_CHARS:,} chars)",
         f"Reason: {reason}",
     ]
@@ -157,7 +152,6 @@ def _read_file(args: dict, ctx: dict) -> dict:
                     continue
                 if needle and needle not in raw_line.lower():
                     continue
-
                 if len(collected) >= max_lines:
                     has_more = True
                     break
@@ -178,10 +172,10 @@ def _read_file(args: dict, ctx: dict) -> dict:
     except OSError as e:
         return {"error": f"Failed to read file: {e}"}
 
-    result = {
+    result: dict = {
         "root": root_name,
         "path": display_rel,
-        "size": _format_size(size_bytes),
+        "size": format_bytes(size_bytes),
         "start_line": start_line,
         "last_line_returned": last_line_seen if collected else None,
         "lines_returned": len(collected),
@@ -192,38 +186,38 @@ def _read_file(args: dict, ctx: dict) -> dict:
     if has_more and collected:
         result["next_start_line"] = last_line_seen + 1
 
-    notes = []
-    if root_note:
-        notes.append(root_note)
-    if target.suffix.lower() == ".csv" and size_bytes > LARGE_CSV_WARN_BYTES:
-        notes.append("Large CSV file — prefer DuckDB SQL if this artifact is mounted as a view.")
+    notes = [n for n in (root_note, "Large CSV file — prefer DuckDB SQL if this artifact is mounted as a view." if target.suffix.lower() == ".csv" and size_bytes > LARGE_CSV_WARN_BYTES else None) if n]
     if notes:
         result["note"] = " ".join(notes)
     return result
 
 
 def _list_directory(args: dict, ctx: dict) -> dict:
-    rel_path = args.get("path", ".")
+    rel_path = str(args.get("path") or ".")
     root = args.get("root")
     target, root_name, root_dir, root_note, err = _resolve_target(ctx, rel_path, root)
-    if err:
-        return {"error": err}
+    if err or target is None or root_dir is None:
+        return {"error": err or "Could not resolve path."}
     if not target.exists() or not target.is_dir():
         return {"error": f"Directory not found: {rel_path}"}
 
-    entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    try:
+        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError as e:
+        return {"error": f"Failed to list directory: {e}"}
+
     items = []
     for entry in entries[:MAX_LIST_ENTRIES]:
         if entry.is_dir():
             items.append({"name": entry.name + "/", "type": "dir"})
         else:
             try:
-                sz = _format_size(entry.stat().st_size)
+                sz = format_bytes(entry.stat().st_size)
             except OSError:
                 sz = "?"
             items.append({"name": entry.name, "type": "file", "size": sz})
 
-    result = {
+    result: dict = {
         "root": root_name,
         "path": target.relative_to(root_dir).as_posix(),
         "total_entries": len(entries),

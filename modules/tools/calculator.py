@@ -1,5 +1,6 @@
 import ast
 import operator
+
 from modules.llm_ui import console
 
 _BIN_OPS = {
@@ -23,29 +24,42 @@ _UNARY_OPS = {
     ast.Invert: operator.invert,
 }
 
+_MAX_EXPONENT = 1000
+_MAX_SHIFT = 1024
 
-def _eval_node(node):
+
+def _eval_node(node: ast.AST) -> int | float:
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        # Guard against huge exponents or bit shifts that can hang or exhaust memory
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_EXPONENT:
+            raise ValueError(f"Exponent {right} exceeds safety limit ({_MAX_EXPONENT}).")
+        if isinstance(node.op, (ast.LShift, ast.RShift)) and (not isinstance(right, int) or right < 0 or right > _MAX_SHIFT):
+            raise ValueError(f"Bit shift {right} must be an integer in 0..{_MAX_SHIFT}.")
+        return _BIN_OPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
     raise ValueError(f"Unsupported expression syntax: {ast.dump(node)}")
 
 
 def _handle_calc(args: dict, ctx: dict) -> dict:
-    expr = args.get("expression", "").strip()
+    expr = str(args.get("expression") or "").strip()
     if not expr:
         return {"error": "Empty expression."}
 
-    tree = ast.parse(expr, mode="eval")
-    val = _eval_node(tree)
-    console.print(f"[dim][tool] calculate: {expr} = {val}[/dim]")
+    try:
+        tree = ast.parse(expr, mode="eval")
+        val = _eval_node(tree)
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, TypeError) as exc:
+        return {"error": f"Calculation error: {exc}"}
 
-    out = {"expression": expr, "result": val}
+    console.print(f"[dim][tool] calculate: {expr} = {val}[/dim]")
+    out: dict = {"expression": expr, "result": val}
     if isinstance(val, int):
         out["hex"] = hex(val)
     return out

@@ -1,48 +1,57 @@
-import duckdb
 from pathlib import Path
+
+import duckdb
 from rich.console import Console
 from rich.table import Table
+
 from modules import hunts, llm_cli
+from modules.common import ARTIFACT_SOURCES
 
 console = Console(highlight=False)
 
+
+def _is_non_empty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def mount_views(con, base_output: Path) -> set[str]:
     """Mounts available CSV folders as DuckDB views and returns the active view names."""
-    sources = {
-        "evtx": (base_output / "evtx", "*.csv"),
-        "prefetch": (base_output / "prefetch", "*_PECmd_Output.csv"),
-        "prefetch_timeline": (base_output / "prefetch", "*_PECmd_Output_Timeline.csv"),
-        "registry": (base_output / "registry", "*.csv"),
-        "mft": (base_output / "mft", "*.csv"),
-    }
-
     table = Table(title="DuckDB Mounted Views")
     table.add_column("View Name", style="bold cyan")
     table.add_column("CSV Files", justify="right")
     table.add_column("Total Rows", justify="right")
 
-    mounted_views = set()
+    mounted_views: set[str] = set()
 
-    for view_name, (folder, pattern) in sources.items():
-        csv_files = [f for f in folder.glob(pattern) if f.stat().st_size > 0]
+    for view_name, (sub, pattern) in ARTIFACT_SOURCES.items():
+        folder = base_output / sub
+        if not folder.is_dir():
+            continue
+
+        csv_files = [f for f in sorted(folder.glob(pattern)) if _is_non_empty_file(f)]
         if not csv_files:
             continue
 
-        sql_paths = [f"'{f.as_posix().replace(chr(39), chr(39)*2)}'" for f in csv_files]
-        files_list = ", ".join(sql_paths)
+        sql_paths = ", ".join(f"'{f.as_posix().replace(chr(39), chr(39) * 2)}'" for f in csv_files)
 
         try:
-            con.execute(f"""
+            con.execute(
+                f"""
                 CREATE VIEW {view_name} AS
                 SELECT * FROM read_csv(
-                    [{files_list}],
+                    [{sql_paths}],
                     header=true,
                     union_by_name=true,
                     all_varchar=true,
                     ignore_errors=true
                 )
-            """)
-            row_count = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()[0]
+                """
+            )
+            row = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()
+            row_count = row[0] if row else 0
             table.add_row(view_name, str(len(csv_files)), f"{row_count:,}")
             mounted_views.add(view_name)
         except duckdb.Error as e:
@@ -53,14 +62,7 @@ def mount_views(con, base_output: Path) -> set[str]:
     return mounted_views
 
 
-def llm_cli_placeholder(con, mounted_views: set[str], base_output: Path):
-    """Placeholder for Milestone 4: Interactive LLM investigation loop."""
-    console.print("\n[bold cyan]=== Entering LLM Investigation CLI (Placeholder) ===[/bold cyan]")
-    console.print(f"Active DuckDB views ready for querying: {', '.join(sorted(mounted_views))}")
-    console.print("[dim](Milestone 4 LLM loop will live here while DuckDB remains open.)[/dim]\n")
-
-
-def run_triage(base_output: Path, main_directory: Path | None = None):
+def run_triage(base_output: Path, main_directory: Path | None = None) -> None:
     with duckdb.connect(":memory:") as con:
         con.execute("SET memory_limit = '2GB';")
 
@@ -71,14 +73,18 @@ def run_triage(base_output: Path, main_directory: Path | None = None):
 
         console.print("\nRun initial triage (default baseline queries for available artifacts)?")
         while True:
-            choice = input("Continue? [Y]es / [n]o: ").strip().lower()
+            try:
+                choice = input("Continue? [Y]es / [n]o: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow][-] Skipping initial triage queries.[/yellow]")
+                break
+
             if choice in ("", "y", "yes"):
                 hunts.run_all(con, mounted_views, base_output)
                 break
-            elif choice in ("n", "no"):
+            if choice in ("n", "no"):
                 console.print("[yellow][-] Skipping initial triage queries.[/yellow]")
                 break
-            else:
-                console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
+            console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
 
         llm_cli.start_cli(con, mounted_views, base_output, main_directory=main_directory)

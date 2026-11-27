@@ -2,15 +2,9 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from modules.llm_ui import confirm_action, console
 
-ARTIFACT_SOURCES = {
-    "evtx": ("evtx", "*.csv"),
-    "prefetch": ("prefetch", "*_PECmd_Output.csv"),
-    "prefetch_timeline": ("prefetch", "*_PECmd_Output_Timeline.csv"),
-    "registry": ("registry", "*.csv"),
-    "mft": ("mft", "*.csv"),
-}
+from modules.common import ARTIFACT_SOURCES
+from modules.llm_ui import confirm_action, console
 
 
 def _find_timeline_explorer() -> Path | None:
@@ -19,14 +13,12 @@ def _find_timeline_explorer() -> Path | None:
     if env_path and Path(env_path).is_file():
         return Path(env_path)
 
-    which_path = shutil.which("TimelineExplorer.exe")
-    if which_path:
+    if which_path := shutil.which("TimelineExplorer.exe"):
         return Path(which_path)
 
     tools_dir = Path("tools")
     if tools_dir.is_dir():
-        for match in tools_dir.rglob("TimelineExplorer.exe"):
-            return match
+        return next(tools_dir.rglob("TimelineExplorer.exe"), None)
     return None
 
 
@@ -43,37 +35,41 @@ def _resolve_csv_files(
     main_resolved = main_directory.resolve() if main_directory is not None else None
     search_roots = [base_resolved] + ([main_resolved] if main_resolved and main_resolved != base_resolved else [])
 
-    def _is_confined(p_res: Path) -> bool:
-        return any(p_res.is_relative_to(root) for root in search_roots)
-
     def _add(p: Path) -> bool:
-        p_res = p.resolve()
-        if _is_confined(p_res) and p_res.is_file() and p_res.suffix.lower() == ".csv" and p_res not in seen:
+        try:
+            p_res = p.resolve()
+            is_valid = (
+                any(p_res.is_relative_to(root) for root in search_roots)
+                and p_res.is_file()
+                and p_res.suffix.lower() == ".csv"
+                and p_res not in seen
+            )
+        except OSError:
+            return False
+        if is_valid:
             seen.add(p_res)
             resolved.append(p_res)
             return True
         return False
 
     for name in artifacts:
-        key = name.strip().lower()
+        key = str(name).strip().lower()
         if key in ARTIFACT_SOURCES:
             sub, pattern = ARTIFACT_SOURCES[key]
             for f in sorted((base_resolved / sub).glob(pattern)):
-                if f.stat().st_size > 0:
-                    _add(f)
+                try:
+                    if f.stat().st_size > 0:
+                        _add(f)
+                except OSError:
+                    continue
 
     for rel in files:
-        candidate = Path(rel)
+        candidate = Path(str(rel))
         if candidate.is_absolute():
             _add(candidate)
             continue
 
-        matched = False
-        for root in search_roots:
-            if _add(root / rel):
-                matched = True
-                break
-        if not matched:
+        if not any(_add(root / candidate) for root in search_roots):
             for root in search_roots:
                 for match in sorted(root.rglob(candidate.name)):
                     _add(match)
@@ -87,7 +83,7 @@ def _handle_open_gui(args: dict, ctx: dict) -> dict:
     main_directory = Path(raw_main) if raw_main else None
     artifacts = args.get("artifacts") or []
     files = args.get("files") or []
-    reason = args.get("reason", "Open parsed CSVs for manual analyst review")
+    reason = str(args.get("reason") or "Open parsed CSVs for manual analyst review")
 
     exe = _find_timeline_explorer()
     if not exe:
@@ -106,7 +102,11 @@ def _handle_open_gui(args: dict, ctx: dict) -> dict:
     main_resolved = main_directory.resolve() if main_directory else None
     preview_lines = [f"Reason: {reason}"]
     for p in targets:
-        size_mb = p.stat().st_size / (1024 * 1024)
+        try:
+            size_mb = p.stat().st_size / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+
         if p.is_relative_to(base_resolved):
             rel_display = f"[output] {p.relative_to(base_resolved).as_posix()}"
         elif main_resolved and p.is_relative_to(main_resolved):
@@ -120,11 +120,15 @@ def _handle_open_gui(args: dict, ctx: dict) -> dict:
         return {"status": "rejected_by_analyst", "message": "Analyst declined to open Timeline Explorer."}
 
     # Non-blocking launch so the CLI remains responsive while you inspect in the GUI
-    subprocess.Popen([str(exe), *[str(t) for t in targets]])
+    try:
+        subprocess.Popen([str(exe), *(str(t) for t in targets)])
+    except OSError as exc:
+        return {"error": f"Failed to launch TimelineExplorer.exe: {exc}"}
+
     console.print(f"[green][+] Launched TimelineExplorer.exe with {len(targets)} file(s).[/green]")
     return {
         "status": "launched",
-        "opened_files": [str(t.name) for t in targets],
+        "opened_files": [t.name for t in targets],
     }
 
 

@@ -48,7 +48,7 @@ def _strip_sql_comments_and_strings(sql: str) -> str:
 
 def validate_readonly_sql(sql: str) -> tuple[bool, str | None]:
     """Validates that a query is a single read-only statement without external/system functions."""
-    cleaned = _strip_sql_comments_and_strings(sql).strip()
+    cleaned = _strip_sql_comments_and_strings(sql or "").strip()
     if not cleaned:
         return False, "Empty SQL query."
 
@@ -58,12 +58,10 @@ def validate_readonly_sql(sql: str) -> tuple[bool, str | None]:
     if not _ALLOWED_START.match(cleaned):
         return False, "Only read-only SELECT/WITH/DESCRIBE/SHOW/SUMMARIZE/EXPLAIN queries are permitted."
 
-    kw = _FORBIDDEN_KEYWORDS.search(cleaned)
-    if kw:
+    if kw := _FORBIDDEN_KEYWORDS.search(cleaned):
         return False, f"Blocked forbidden SQL keyword: {kw.group(1).upper()}"
 
-    fn = _FORBIDDEN_FUNCTIONS.search(cleaned)
-    if fn:
+    if fn := _FORBIDDEN_FUNCTIONS.search(cleaned):
         return False, f"Blocked external/system DuckDB function: {fn.group(1)}()"
 
     return True, None
@@ -82,7 +80,7 @@ def _trim_for_llm(columns: list[str], rows: list[list[str]]) -> tuple[list[dict[
     for row in rows:
         record: dict[str, str] = {}
         for col, val in zip(columns, row):
-            if val == "":
+            if not val:
                 continue
             if len(val) > MAX_LLM_CELL_CHARS:
                 val = val[: MAX_LLM_CELL_CHARS - 1] + "…"
@@ -111,18 +109,19 @@ def execute_sql(
         console.print(f"[red][!] SQL Rejected: {err}[/red]")
         return {"error": err}
 
+    row_limit = max(1, max_rows)
     clean_sql = sql.strip().rstrip(";")
     try:
         cursor = con.execute(clean_sql)
         columns = [desc[0] for desc in (cursor.description or [])]
-        raw_rows = cursor.fetchmany(max_rows + 1)
+        raw_rows = cursor.fetchmany(row_limit + 1)
     except duckdb.Error as exc:
         console.print(f"[red][!] DuckDB Error: {exc}[/red]")
         return {"error": f"DuckDB error: {exc}"}
 
-    truncated = len(raw_rows) > max_rows
+    truncated = len(raw_rows) > row_limit
     if truncated:
-        raw_rows = raw_rows[:max_rows]
+        raw_rows = raw_rows[:row_limit]
 
     rows = [[_stringify(cell) for cell in row] for row in raw_rows]
     qid = len(history) + 1
@@ -142,7 +141,7 @@ def execute_sql(
         console.print(f"[dim][+] Query #{qid}: {len(rows)}{suffix} rows returned (use /show {qid} to view).[/dim]")
 
     llm_rows, llm_clipped = _trim_for_llm(columns, rows)
-    result = {
+    result: dict = {
         "query_id": qid,
         "columns": columns,
         "row_count": len(rows),
@@ -175,7 +174,7 @@ def _query_duckdb(args: dict, ctx: dict) -> dict:
         show_table = False
     else:
         decision = confirm_sql(reason, sql)
-        if decision in (False, "no", "n"):
+        if decision == "no":
             return {"status": "declined", "message": "Analyst declined SQL execution."}
         show_table = decision == "table"
 

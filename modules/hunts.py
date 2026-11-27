@@ -1,6 +1,7 @@
 import json
-import duckdb
 from pathlib import Path
+
+import duckdb
 from rich.console import Console
 from rich.table import Table
 
@@ -59,45 +60,47 @@ HUNTS = [
             ORDER BY Hits DESC
             LIMIT 20
         """,
-    }
+    },
 ]
 
 
-def _render_table(title: str, columns: list[str], rows: list[tuple]):
+def _render_table(title: str, columns: list[str], rows: list[tuple]) -> None:
     table = Table(title=title)
     for col in columns:
         table.add_column(str(col), overflow="fold")
     for row in rows:
-        table.add_row(*["" if val is None else str(val) for val in row])
+        table.add_row(*("" if val is None else str(val) for val in row))
     console.print()
     console.print(table)
 
 
-def run_all(con, mounted_views: set[str], base_output: Path):
+def run_all(con, mounted_views: set[str], base_output: Path) -> None:
     """Executes all registered hunts whose required views exist in DuckDB."""
-    findings = {}
+    findings: dict[str, list[dict]] = {}
 
     for hunt in HUNTS:
-        # Skip query if any required artifact view is missing
         if not all(view in mounted_views for view in hunt["requires"]):
             continue
 
         try:
             cursor = con.execute(hunt["sql"])
-            columns = [desc[0] for desc in cursor.description]
+            columns = [desc[0] for desc in (cursor.description or [])]
             rows = cursor.fetchall()
         except duckdb.Error as e:
             console.print(f"[red][!] Query failed ({hunt['title']}): {e}[/red]")
             continue
 
         findings[hunt["title"]] = [dict(zip(columns, row)) for row in rows]
-
         if rows:
             _render_table(hunt["title"], columns, rows)
         else:
             console.print(f"[dim][-] {hunt['title']}: 0 hits[/dim]")
 
     summary_path = base_output / "triage_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(findings, f, indent=2)
-    console.print(f"\n[green][+] Initial triage saved to: {summary_path.resolve()}[/green]")
+    try:
+        base_output.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(findings, f, indent=2, default=str)
+        console.print(f"\n[green][+] Initial triage saved to: {summary_path.resolve()}[/green]")
+    except OSError as e:
+        console.print(f"[red][!] Could not save triage summary: {e}[/red]")

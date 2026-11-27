@@ -1,27 +1,34 @@
 import base64
+import binascii
+
 from modules.llm_ui import console
 
 
+def _clean_hex(raw: str) -> str:
+    cleaned = raw.replace("0x", "").replace("0X", "").replace("\\x", "").replace(",", "")
+    return "".join(cleaned.split())
+
+
 def _decode_base64(args: dict, ctx: dict) -> dict:
-    raw = "".join(args.get("data", "").split())
+    raw = "".join(str(args.get("data") or "").split())
     if not raw:
         return {"error": "Empty Base64 input."}
 
-    # Restore stripped '=' padding if needed
-    pad = (-len(raw)) % 4
-    padded = raw + ("=" * pad)
+    # Normalize URL-safe alphabet and restore stripped '=' padding while still validating characters
+    normalized = raw.replace("-", "+").replace("_", "/")
+    padded = normalized + ("=" * ((-len(normalized)) % 4))
 
     try:
-        decoded_bytes = base64.urlsafe_b64decode(padded)
-    except Exception as e:
+        decoded_bytes = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError) as e:
         return {"error": f"Base64 decode failed: {e}"}
 
     # PowerShell -EncodedCommand uses UTF-16LE (alternating null bytes on ASCII text)
-    encoding_used = "utf-8"
     if len(decoded_bytes) >= 2 and decoded_bytes[1::2].count(0) > len(decoded_bytes) // 4:
-        text = decoded_bytes.decode("utf-16-le", errors="replace")
         encoding_used = "utf-16-le (PowerShell)"
+        text = decoded_bytes.decode("utf-16-le", errors="replace")
     else:
+        encoding_used = "utf-8"
         text = decoded_bytes.decode("utf-8", errors="replace")
 
     console.print(f"[dim][tool] decode_base64 ({encoding_used}, {len(decoded_bytes)} bytes)[/dim]")
@@ -34,13 +41,10 @@ def _decode_base64(args: dict, ctx: dict) -> dict:
 
 
 def _decode_hex(args: dict, ctx: dict) -> dict:
-    cleaned = (
-        args.get("hex_string", "")
-        .replace("0x", "")
-        .replace("\\x", "")
-        .replace(",", "")
-    )
-    cleaned = "".join(cleaned.split())
+    cleaned = _clean_hex(str(args.get("hex_string") or ""))
+    if not cleaned:
+        return {"error": "Empty hex string."}
+
     try:
         raw = bytes.fromhex(cleaned)
     except ValueError as e:
@@ -54,17 +58,28 @@ def _decode_hex(args: dict, ctx: dict) -> dict:
     }
 
 
+def _parse_xor_input(raw: str, fmt: str, label: str) -> bytes:
+    if fmt == "hex":
+        cleaned = _clean_hex(raw)
+        if not cleaned:
+            raise ValueError(f"Empty {label} hex input.")
+        return bytes.fromhex(cleaned)
+    if fmt == "text":
+        return raw.encode("utf-8")
+    raise ValueError(f"Invalid {label}_format '{fmt}'. Use 'hex' or 'text'.")
+
+
 def _xor_bytes(args: dict, ctx: dict) -> dict:
-    data_str = args.get("data", "")
-    data_format = args.get("data_format", "hex").lower()
-    key_str = args.get("key", "")
-    key_format = args.get("key_format", "hex").lower()
+    data_str = str(args.get("data") or "")
+    data_format = str(args.get("data_format") or "hex").lower()
+    key_str = str(args.get("key") or "")
+    key_format = str(args.get("key_format") or "hex").lower()
 
     try:
-        data_bytes = bytes.fromhex("".join(data_str.replace("0x", "").split())) if data_format == "hex" else data_str.encode("utf-8")
-        key_bytes = bytes.fromhex("".join(key_str.replace("0x", "").split())) if key_format == "hex" else key_str.encode("utf-8")
+        data_bytes = _parse_xor_input(data_str, data_format, "data")
+        key_bytes = _parse_xor_input(key_str, key_format, "key")
     except ValueError as e:
-        return {"error": f"Invalid hex input: {e}"}
+        return {"error": str(e)}
 
     if not key_bytes:
         return {"error": "XOR key cannot be empty."}

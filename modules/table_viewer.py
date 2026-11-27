@@ -19,36 +19,36 @@ MAX_TABLE_CELL_CHARS = 160
 MAX_CARD_CELL_CHARS = 500
 MIN_TABLE_COL_WIDTH = 14
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
 
 def pid_is_alive(pid: int) -> bool:
     """Returns True if a process with the given PID is currently running."""
     if pid <= 0:
         return False
     if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return ctypes.get_last_error() == 5  # ACCESS_DENIED -> process exists
         try:
             exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return False
-            return exit_code.value == STILL_ACTIVE
+            return exit_code.value == _STILL_ACTIVE
         finally:
-            kernel32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
 
     try:
         os.kill(pid, 0)
@@ -78,11 +78,10 @@ def _render_waiting(console: Console) -> None:
 
 def _filter_empty_columns(columns: list[str], rows: list[list]) -> tuple[list[str], list[list], list[str]]:
     """Drops columns that are empty across every row so wide EVTX queries stay compact."""
-    keep_idx = []
-    hidden = []
+    keep_idx: list[int] = []
+    hidden: list[str] = []
     for i, col in enumerate(columns):
-        has_val = any(i < len(r) and r[i] is not None and str(r[i]).strip() != "" for r in rows)
-        if has_val:
+        if any(i < len(r) and r[i] is not None and str(r[i]).strip() for r in rows):
             keep_idx.append(i)
         else:
             hidden.append(str(col))
@@ -206,6 +205,7 @@ def watch(state_path: Path, parent_pid: int | None = None, poll_interval: float 
     last_data: dict | None = None
     last_size = console.size
     parent_died = False
+    interval = max(0.05, poll_interval)
 
     try:
         while True:
@@ -223,6 +223,8 @@ def watch(state_path: Path, parent_pid: int | None = None, poll_interval: float 
             if mtime != last_mtime:
                 try:
                     data = json.loads(state_path.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("close"):
                         break
                     last_data = data
@@ -235,7 +237,7 @@ def watch(state_path: Path, parent_pid: int | None = None, poll_interval: float 
                 last_size = console.size
                 render_payload(console, last_data)
 
-            time.sleep(poll_interval)
+            time.sleep(interval)
     except KeyboardInterrupt:
         pass
     finally:

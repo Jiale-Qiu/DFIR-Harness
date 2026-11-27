@@ -1,14 +1,4 @@
-"""
-# NVIDIA NIM
-$env:OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
-$env:OPENAI_API_KEY="nvapi-your-key-here"
-$env:LLM_MODEL="mistralai/mistral-large-4-1t-a52b"
-
-# Or switch to Groq in the same terminal
-$env:OPENAI_BASE_URL="https://api.groq.com/openai/v1"
-$env:OPENAI_API_KEY="gsk_your-key-here"
-$env:LLM_MODEL="llama-3.3-70b-versatile"
-"""
+"""Interactive DFIR investigation CLI powered by OpenAI-compatible APIs and DuckDB."""
 
 import json
 import os
@@ -18,6 +8,7 @@ import duckdb
 from openai import OpenAI
 from rich.table import Table
 
+from modules.common import format_bytes
 from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
 from modules.pane_bridge import (
     clear_result_pane,
@@ -41,23 +32,16 @@ MAX_TOKENS = 8192
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
     """Extracts row counts and column names for each mounted DuckDB view."""
-    schemas = {}
+    schemas: dict[str, dict] = {}
     for view in sorted(mounted_views):
         try:
-            row_count = con.execute(f'SELECT COUNT(*) FROM "{view}"').fetchone()[0]
-            cols = [row[0] for row in con.execute(f'DESCRIBE "{view}"').fetchall()]
+            row = con.execute(f'SELECT COUNT(*) FROM "{view}"').fetchone()
+            row_count = row[0] if row else 0
+            cols = [desc[0] for desc in con.execute(f'DESCRIBE "{view}"').fetchall()]
             schemas[view] = {"rows": row_count, "columns": cols}
         except duckdb.Error:
             continue
     return schemas
-
-
-def _format_bytes(size: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
-        size /= 1024
-    return f"{size:.1f} GB"
 
 
 def _build_directory_tree(root_dir: Path, max_entries: int = 120, max_depth: int = 4) -> str:
@@ -89,7 +73,7 @@ def _build_directory_tree(root_dir: Path, max_entries: int = 120, max_depth: int
                     _walk(entry, depth + 1)
             else:
                 try:
-                    sz = _format_bytes(entry.stat().st_size)
+                    sz = format_bytes(entry.stat().st_size)
                 except OSError:
                     sz = "?"
                 lines.append(f"{indent}{entry.name} ({sz})")
@@ -118,21 +102,20 @@ def _build_system_prompt(
         main_resolved = main_directory.resolve()
         if main_resolved == base_resolved:
             source_section = (
-                f"### Source Investigation Directory (`root=\"source\"`)\n"
+                f'### Source Investigation Directory (`root="source"`)\n'
                 f"Same as the parsed output directory (`{main_resolved}`).\n\n"
             )
         elif main_resolved.is_dir():
             source_tree = _build_directory_tree(main_resolved)
             source_section = (
-                f"### Source Investigation Directory Tree (`root=\"source\"`, {main_resolved})\n"
+                f'### Source Investigation Directory Tree (`root="source"`, {main_resolved})\n'
                 f"Raw/unparsed case artifacts in the selected investigation directory:\n```\n"
-                + source_tree
-                + "\n```\n\n"
+                f"{source_tree}\n```\n\n"
             )
 
     triage_block = ""
     summary_path = base_output / "triage_summary.json"
-    if summary_path.exists():
+    if summary_path.is_file():
         try:
             raw = summary_path.read_text(encoding="utf-8").strip()
             if raw and raw != "{}":
@@ -150,7 +133,7 @@ def _build_system_prompt(
         + "\n".join(schema_lines)
         + "\n\n"
         + source_section
-        + f"### Parsed Output Directory Tree (`root=\"output\"`, {base_resolved})\n```\n"
+        + f'### Parsed Output Directory Tree (`root="output"`, {base_resolved})\n```\n'
         + output_tree
         + "\n```\n\n### Critical Tool & Query Rules\n"
         "1. Every DuckDB view was mounted with `all_varchar=true` — ALL columns are VARCHAR strings.\n"
@@ -161,15 +144,15 @@ def _build_system_prompt(
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
         "5. File Inspection (`read_file` / `list_directory`): Use `read_file` to inspect logs, scripts, JSON, "
-        "or unmounted text artifacts in either the source investigation directory (`root=\"source\"`) or the "
-        "parsed output directory (`root=\"output\"`). Prefer specifying `root` explicitly when a folder name "
+        'or unmounted text artifacts in either the source investigation directory (`root="source"`) or the '
+        'parsed output directory (`root="output"`). Prefer specifying `root` explicitly when a folder name '
         "exists in both trees. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
         "slices rather than trying to read whole files. Never use `read_file` on large CSVs that are already "
         "mounted in DuckDB.\n"
         "6. Terminal Execution (`run_terminal`) — STRICT LAST RESORT ONLY: Only propose a terminal command "
         "when NO other registered tool (DuckDB SQL, `read_file`, `list_directory`, decoders, etc.) can complete "
-        "the task. Always state in `reason` why built-in tools cannot do it, set `root` (`\"output\"` or "
-        "`\"source\"`) if needed, and keep commands read-only and output-bounded.\n"
+        'the task. Always state in `reason` why built-in tools cannot do it, set `root` (`"output"` or '
+        '`"source"`) if needed, and keep commands read-only and output-bounded.\n'
         "7. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
@@ -185,10 +168,10 @@ def _stream_completion(
     state: dict,
     allow_tools: bool = True,
     reasoning_override: str | None = None,
-):
+) -> tuple[str, str, list[dict], str | None]:
     """Streams one LLM turn, returning (reply_text, reasoning_text, tool_calls_list, finish_reason)."""
     effective_reasoning = reasoning_override if reasoning_override is not None else state["reasoning"]
-    request_kwargs = {
+    request_kwargs: dict = {
         "model": model,
         "messages": messages,
         "temperature": 0.3,
@@ -247,6 +230,15 @@ def _stream_completion(
     return "".join(answer_chunks), "".join(reasoning_chunks), tool_calls, finish_reason
 
 
+def _set_enum_option(state: dict, key: str, label: str, arg: str, valid: tuple[str, ...]) -> None:
+    val = arg.lower()
+    if val in valid:
+        state[key] = val
+        console.print(f"[cyan][*] {label} set to: {val}[/cyan]\n")
+    else:
+        console.print(f"[yellow][!] Current: {state[key]} | Usage: /{key.replace('_mode', '')} <{'|'.join(valid)}>[/yellow]\n")
+
+
 def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: list[dict]) -> bool:
     """Handles local CLI commands. Returns True if input was consumed locally."""
     cmd, _, arg = user_input.partition(" ")
@@ -267,22 +259,20 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
 
         latest = state["history"][-1] if state["history"] else None
         status = open_result_pane(pane_path, initial_entry=latest)
-        if status == "opened":
-            console.print("[cyan][*] Opened right-side query viewer pane (type '/pane off' to close).[/cyan]\n")
-        elif status == "already_open":
-            console.print("[cyan][*] Query viewer pane is already open.[/cyan]\n")
-        else:
-            console.print("[yellow][!] /pane requires Windows Terminal.[/yellow]\n")
+        msgs = {
+            "opened": "[cyan][*] Opened right-side query viewer pane (type '/pane off' to close).[/cyan]\n",
+            "already_open": "[cyan][*] Query viewer pane is already open.[/cyan]\n",
+        }
+        console.print(msgs.get(status, "[yellow][!] /pane requires Windows Terminal.[/yellow]\n"))
         return True
 
     if cmd_lower == "/autosql":
         arg_lower = arg.lower()
-        if arg_lower in ("on", "true", "1"):
-            state["auto_sql"] = True
-        elif arg_lower in ("off", "false", "0"):
-            state["auto_sql"] = False
-        elif not arg_lower:
+        toggle_map = {"on": True, "true": True, "1": True, "off": False, "false": False, "0": False}
+        if not arg_lower:
             state["auto_sql"] = not state["auto_sql"]
+        elif arg_lower in toggle_map:
+            state["auto_sql"] = toggle_map[arg_lower]
         else:
             console.print("[yellow][!] Usage: /autosql [on|off][/yellow]\n")
             return True
@@ -297,19 +287,11 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         return True
 
     if cmd_lower == "/reasoning":
-        if arg.lower() in VALID_LEVELS:
-            state["reasoning"] = arg.lower()
-            console.print(f"[cyan][*] Reasoning level set to: {state['reasoning']}[/cyan]\n")
-        else:
-            console.print(f"[yellow][!] Current: {state['reasoning']} | Usage: /reasoning <low|medium|high|off>[/yellow]\n")
+        _set_enum_option(state, "reasoning", "Reasoning level", arg, VALID_LEVELS)
         return True
 
     if cmd_lower == "/thinking":
-        if arg.lower() in VALID_THINKING_MODES:
-            state["thinking_mode"] = arg.lower()
-            console.print(f"[cyan][*] Thinking display set to: {state['thinking_mode']}[/cyan]\n")
-        else:
-            console.print(f"[yellow][!] Current: {state['thinking_mode']} | Usage: /thinking <collapse|full|off>[/yellow]\n")
+        _set_enum_option(state, "thinking_mode", "Thinking display", arg, VALID_THINKING_MODES)
         return True
 
     if cmd_lower == "/show":
@@ -319,16 +301,18 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
             return True
         idx = len(history) - 1
         if arg:
-            if not arg.isdigit() or not (1 <= int(arg) <= len(history)):
+            try:
+                idx = int(arg) - 1
+            except ValueError:
+                idx = -1
+            if not (0 <= idx < len(history)):
                 console.print(f"[yellow][!] Valid query range: 1..{len(history)}[/yellow]\n")
                 return True
-            idx = int(arg) - 1
 
         entry = history[idx]
         if is_pane_alive(pane_path):
             publish_result(pane_path, entry)
-            qid = entry.get("id") or (idx + 1)
-            console.print(f"[cyan][*] Displayed Query #{qid} in right pane.[/cyan]\n")
+            console.print(f"[cyan][*] Displayed Query #{entry.get('id') or (idx + 1)} in right pane.[/cyan]\n")
         else:
             print_result_table(entry)
             print()
@@ -371,11 +355,103 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
     return False
 
 
-def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: Path | None = None):
+def _build_retry_messages(messages: list[dict], last_reasoning: str) -> list[dict]:
+    """Appends a synthesis-only nudge when a model emits reasoning without a final answer."""
+    nudge = (
+        "Tool calling is disabled. Do not output chain-of-thought reasoning or "
+        "attempt tool calls. Write the final DFIR response for the investigator "
+        "now based on the evidence gathered so far."
+    )
+    trimmed = last_reasoning.strip()[-6000:]
+    if trimmed:
+        nudge += (
+            "\n\nSynthesize your prior analysis below into a clear final answer:\n"
+            f"<prior_analysis>\n{trimmed}\n</prior_analysis>"
+        )
+    return [*messages, {"role": "user", "content": nudge}]
+
+
+def _run_agent_turn(client: OpenAI, model: str, messages: list[dict], ctx: dict, turn_start_idx: int) -> None:
+    """Executes up to MAX_TOOL_ROUNDS of LLM calls and tool dispatches for one user prompt."""
+    state = ctx["state"]
+    pane_path = state["pane_path"]
+    empty_retries = 0
+    last_reasoning = ""
+    round_idx = 0
+
+    while round_idx < MAX_TOOL_ROUNDS:
+        # Reserve the final round (and empty-reply retries) for synthesis
+        allow_tools = (round_idx < (MAX_TOOL_ROUNDS - 1)) and (empty_retries == 0)
+        call_messages = _build_retry_messages(messages, last_reasoning) if empty_retries > 0 else messages
+
+        reply, reasoning, tool_calls, finish_reason = _stream_completion(
+            client,
+            model,
+            call_messages,
+            state,
+            allow_tools=allow_tools,
+            reasoning_override="off" if empty_retries > 0 else None,
+        )
+
+        if finish_reason == "length":
+            console.print(f"[yellow][!] Response hit max_tokens ({MAX_TOKENS}) and was cut short.[/yellow]\n")
+
+        if not tool_calls:
+            if reply.strip():
+                messages.append({"role": "assistant", "content": reply})
+                return
+
+            if empty_retries < 1:
+                empty_retries += 1
+                last_reasoning = reasoning
+                console.print(
+                    f"[yellow][*] Model returned no final answer "
+                    f"(finish_reason={finish_reason or 'unknown'}) — retrying synthesis...[/yellow]"
+                )
+                continue
+
+            console.print(
+                f"[yellow][!] Model still returned no final answer "
+                f"(finish_reason={finish_reason or 'unknown'}).[/yellow]"
+            )
+            fallback = reasoning.strip() or last_reasoning.strip()
+            if fallback and state["thinking_mode"] != "full":
+                console.print("[dim]--- Captured reasoning (no final reply emitted) ---[/dim]")
+                console.print(fallback, style="dim")
+            print()
+
+            if round_idx > 0:
+                # Keep executed tool results in context with a valid assistant turn
+                messages.append({"role": "assistant", "content": fallback or "[No final summary returned]"})
+            else:
+                del messages[turn_start_idx:]
+            return
+
+        empty_retries = 0
+        last_reasoning = ""
+        messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
+
+        for tc in tool_calls:
+            prev_len = len(state["history"])
+            result = execute_tool(tc["function"]["name"], tc["function"]["arguments"], ctx)
+            if len(state["history"]) > prev_len:
+                publish_result(pane_path, state["history"][-1])
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(result, ensure_ascii=False),
+                }
+            )
+        round_idx += 1
+
+    console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
+
+
+def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: Path | None = None) -> None:
     """Interactive DFIR investigation CLI with DuckDB schema grounding and HITL tool execution."""
     api_key = os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("LLM_MODEL")
-
     if not api_key or not model:
         console.print("[red][!] Missing config. Set OPENAI_API_KEY, OPENAI_BASE_URL, and LLM_MODEL.[/red]")
         return
@@ -431,97 +507,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
             messages.append({"role": "user", "content": user_input})
 
             try:
-                empty_retries = 0
-                last_reasoning = ""
-                round_idx = 0
-                while round_idx < MAX_TOOL_ROUNDS:
-                    # Reserve the final round (and empty-reply retries) for synthesis
-                    allow_tools = (round_idx < (MAX_TOOL_ROUNDS - 1)) and (empty_retries == 0)
-                    retry_reasoning = "off" if empty_retries > 0 else None
-
-                    call_messages = messages
-                    if empty_retries > 0:
-                        nudge = (
-                            "Tool calling is disabled. Do not output chain-of-thought reasoning or "
-                            "attempt tool calls. Write the final DFIR response for the investigator "
-                            "now based on the evidence gathered so far."
-                        )
-                        if last_reasoning.strip():
-                            trimmed_reasoning = last_reasoning.strip()[-6000:]
-                            nudge += (
-                                "\n\nSynthesize your prior analysis below into a clear final answer:\n"
-                                f"<prior_analysis>\n{trimmed_reasoning}\n</prior_analysis>"
-                            )
-                        call_messages = [*messages, {"role": "user", "content": nudge}]
-
-                    reply, reasoning, tool_calls, finish_reason = _stream_completion(
-                        client,
-                        model,
-                        call_messages,
-                        ctx["state"],
-                        allow_tools=allow_tools,
-                        reasoning_override=retry_reasoning,
-                    )
-
-                    if finish_reason == "length":
-                        console.print(f"[yellow][!] Response hit max_tokens ({MAX_TOKENS}) and was cut short.[/yellow]\n")
-
-                    if not tool_calls:
-                        if reply.strip():
-                            messages.append({"role": "assistant", "content": reply})
-                            break
-
-                        if empty_retries < 1:
-                            empty_retries += 1
-                            last_reasoning = reasoning
-                            console.print(
-                                f"[yellow][*] Model returned no final answer "
-                                f"(finish_reason={finish_reason or 'unknown'}) — retrying synthesis...[/yellow]"
-                            )
-                            continue
-
-                        console.print(
-                            f"[yellow][!] Model still returned no final answer "
-                            f"(finish_reason={finish_reason or 'unknown'}).[/yellow]"
-                        )
-                        fallback_reasoning = reasoning.strip() or last_reasoning.strip()
-                        if fallback_reasoning and ctx["state"]["thinking_mode"] != "full":
-                            console.print("[dim]--- Captured reasoning (no final reply emitted) ---[/dim]")
-                            console.print(fallback_reasoning, style="dim")
-                        print()
-
-                        if round_idx > 0:
-                            # Keep executed tool results in context with a valid assistant turn
-                            messages.append(
-                                {
-                                    "role": "assistant",
-                                    "content": fallback_reasoning or "[No final summary returned]",
-                                }
-                            )
-                        else:
-                            del messages[turn_start_idx:]
-                        break
-
-                    empty_retries = 0
-                    last_reasoning = ""
-                    messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
-
-                    for tc in tool_calls:
-                        prev_len = len(ctx["state"]["history"])
-                        result = execute_tool(tc["function"]["name"], tc["function"]["arguments"], ctx)
-                        if len(ctx["state"]["history"]) > prev_len:
-                            publish_result(pane_path, ctx["state"]["history"][-1])
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": json.dumps(result, ensure_ascii=False),
-                            }
-                        )
-                    round_idx += 1
-                else:
-                    console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
-
+                _run_agent_turn(client, model, messages, ctx, turn_start_idx)
             except KeyboardInterrupt:
                 console.print("\n[yellow][-] Generation interrupted.[/yellow]\n")
                 del messages[turn_start_idx:]

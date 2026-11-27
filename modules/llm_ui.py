@@ -1,4 +1,7 @@
+import os
 import threading
+from typing import TypeVar
+
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -11,6 +14,8 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console(highlight=False)
+
+_T = TypeVar("_T")
 
 
 class StreamRenderer:
@@ -155,13 +160,13 @@ class StreamRenderer:
 
         for i, line in enumerate(complete_lines):
             stripped = line.strip()
-            if stripped.startswith("```") or stripped.startswith("~~~"):
+            if stripped.startswith(("```", "~~~")):
                 in_fence = not in_fence
                 has_content = True
-            elif stripped == "" and not in_fence and has_content:
+            elif not stripped and not in_fence and has_content:
                 last_cut = i + 1
                 has_content = False
-            elif stripped != "":
+            elif stripped:
                 has_content = True
 
         if last_cut > 0:
@@ -225,7 +230,7 @@ class StreamRenderer:
         return Group(panel, status_row)
 
 
-def print_help():
+def print_help() -> None:
     """Prints available investigation CLI slash commands."""
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", padding=(0, 2, 0, 0))
     table.add_column("Command", style="bold green")
@@ -250,11 +255,11 @@ def print_help():
     console.print(table)
 
 
-def print_result_table(entry: dict, max_rows: int = 50):
+def print_result_table(entry: dict, max_rows: int = 50) -> None:
     """Renders a cached query result entry as a Rich Table."""
-    rows = entry["rows"]
-    columns = entry["columns"]
-    truncated = entry["truncated"]
+    rows = entry.get("rows") or []
+    columns = entry.get("columns") or []
+    truncated = bool(entry.get("truncated", False))
     qid = entry.get("id")
 
     if not rows:
@@ -262,15 +267,55 @@ def print_result_table(entry: dict, max_rows: int = 50):
         return
 
     prefix = f"Query #{qid} — " if qid else ""
-    title = f"{prefix}{len(rows)}{'+' if truncated else ''} rows"
-    table = Table(title=title)
+    table = Table(title=f"{prefix}{len(rows)}{'+' if truncated else ''} rows")
     for col in columns:
         table.add_column(str(col), overflow="fold")
     for row in rows:
-        table.add_row(*row)
+        table.add_row(*("" if val is None else str(val) for val in row))
     console.print(table)
     if truncated:
         console.print(f"[yellow][*] Output capped at {max_rows} rows.[/yellow]")
+
+
+def _prompt_panel_choice(
+    title: str,
+    body,
+    border_style: str,
+    prompt_text: str,
+    choices: dict[str, _T],
+    default_decline: _T,
+    decline_msg: str,
+    invalid_msg: str,
+    note: str | None = None,
+) -> _T:
+    """Shared HITL confirmation panel and input loop."""
+    console.print()
+    console.print(
+        Panel(
+            body,
+            title=title,
+            title_align="left",
+            box=box.HORIZONTALS,
+            border_style=border_style,
+            padding=(0, 1),
+        )
+    )
+    if note:
+        console.print(note)
+
+    while True:
+        try:
+            raw = input(prompt_text).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print(decline_msg)
+            return default_decline
+
+        if raw in choices:
+            result = choices[raw]
+            if result == default_decline:
+                console.print(decline_msg)
+            return result
+        console.print(invalid_msg)
 
 
 def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str:
@@ -280,71 +325,41 @@ def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str
         Text(""),
         Syntax(sql.strip(), "sql", theme="monokai", word_wrap=True),
     )
-    console.print()
-    console.print(
-        Panel(
-            content,
-            title="[bold cyan]Proposed SQL[/bold cyan]",
-            title_align="left",
-            box=box.HORIZONTALS,
-            border_style="cyan",
-            padding=(0, 1),
-        )
+    note = (
+        "[yellow][!] Note: Query contains an internal semicolon — inspect carefully.[/yellow]"
+        if has_inner_semicolon
+        else None
     )
-
-    if has_inner_semicolon:
-        console.print("[yellow][!] Note: Query contains an internal semicolon — inspect carefully.[/yellow]")
-
-    while True:
-        try:
-            choice = input("Execute? [Y]es / [t]able / [n]o: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            console.print("[yellow][-] Query declined.[/yellow]")
-            return "no"
-
-        if choice in ("", "y", "yes"):
-            return "yes"
-        if choice in ("t", "table"):
-            return "table"
-        if choice in ("n", "no"):
-            console.print("[yellow][-] Query declined.[/yellow]")
-            return "no"
-        console.print("[red][!] Enter y (quiet), t (show table), or n (decline).[/red]")
+    return _prompt_panel_choice(
+        title="[bold cyan]Proposed SQL[/bold cyan]",
+        body=content,
+        border_style="cyan",
+        prompt_text="Execute? [Y]es / [t]able / [n]o: ",
+        choices={"": "yes", "y": "yes", "yes": "yes", "t": "table", "table": "table", "n": "no", "no": "no"},
+        default_decline="no",
+        decline_msg="[yellow][-] Query declined.[/yellow]",
+        invalid_msg="[red][!] Enter y (quiet), t (show table), or n (decline).[/red]",
+        note=note,
+    )
 
 
 def confirm_action(title: str, details: list[str], prompt: str = "Proceed? [Y]es / [n]o: ") -> bool:
     """Generic HITL approval prompt for side-effect tools like launching GUI viewers."""
     body = Group(*(Text(f"• {line}") for line in details))
-    console.print()
-    console.print(
-        Panel(
-            body,
-            title=f"[bold cyan]{title}[/bold cyan]",
-            title_align="left",
-            box=box.HORIZONTALS,
-            border_style="cyan",
-            padding=(0, 1),
-        )
+    return _prompt_panel_choice(
+        title=f"[bold cyan]{title}[/bold cyan]",
+        body=body,
+        border_style="cyan",
+        prompt_text=prompt,
+        choices={"": True, "y": True, "yes": True, "n": False, "no": False},
+        default_decline=False,
+        decline_msg="[yellow][-] Action declined.[/yellow]",
+        invalid_msg="[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]",
     )
 
-    while True:
-        try:
-            choice = input(prompt).strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            console.print("[yellow][-] Action declined.[/yellow]")
-            return False
-
-        if choice in ("", "y", "yes"):
-            return True
-        if choice in ("n", "no"):
-            console.print("[yellow][-] Action declined.[/yellow]")
-            return False
-        console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
 
 def confirm_terminal(reason: str, command: str, cwd: str) -> bool:
     """High-visibility HITL prompt for last-resort shell commands. Defaults to NO on Enter."""
-    import os
-
     lexer = "powershell" if os.name == "nt" else "bash"
     content = Group(
         Text.assemble(("Working Dir: ", "bold yellow"), (cwd, "dim")),
@@ -352,28 +367,13 @@ def confirm_terminal(reason: str, command: str, cwd: str) -> bool:
         Text(""),
         Syntax(command.strip(), lexer, theme="monokai", word_wrap=True),
     )
-    console.print()
-    console.print(
-        Panel(
-            content,
-            title="[bold red]Proposed Terminal Command (Last Resort)[/bold red]",
-            title_align="left",
-            box=box.HORIZONTALS,
-            border_style="red",
-            padding=(0, 1),
-        )
+    return _prompt_panel_choice(
+        title="[bold red]Proposed Terminal Command (Last Resort)[/bold red]",
+        body=content,
+        border_style="red",
+        prompt_text="Execute shell command? [y]es / [N]o: ",
+        choices={"y": True, "yes": True, "": False, "n": False, "no": False},
+        default_decline=False,
+        decline_msg="[yellow][-] Terminal command declined.[/yellow]",
+        invalid_msg="[red][!] Enter y to execute, or press Enter / n to decline.[/red]",
     )
-
-    while True:
-        try:
-            choice = input("Execute shell command? [y]es / [N]o: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            console.print("[yellow][-] Terminal command declined.[/yellow]")
-            return False
-
-        if choice in ("y", "yes"):
-            return True
-        if choice in ("", "n", "no"):
-            console.print("[yellow][-] Terminal command declined.[/yellow]")
-            return False
-        console.print("[red][!] Enter y to execute, or press Enter / n to decline.[/red]")

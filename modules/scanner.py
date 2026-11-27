@@ -10,33 +10,44 @@ SIGNATURES = [
     ("mft", b"FILE*", 0),
 ]
 
-def testFileMagic(item, magicBytes, offset=0):
+_HEADER_READ_SIZE = max(offset + len(magic) for _, magic, offset in SIGNATURES)
+
+
+def testFileMagic(item: Path | str, magicBytes: bytes, offset: int = 0) -> bool:
     try:
         with open(item, "rb") as f:
             f.seek(offset)
-            file_bytes = f.read(len(magicBytes))
-            return file_bytes == magicBytes
+            return f.read(len(magicBytes)) == magicBytes
     except OSError:
         return False
 
-def scanDirectory(directory):
+
+def _match_header(header: bytes) -> str | None:
+    for category, magic, offset in SIGNATURES:
+        if header[offset : offset + len(magic)] == magic:
+            return category
+    return None
+
+
+def scanDirectory(directory: Path | str) -> dict[str, list[Path]]:
     target_path = Path(directory)
+    files: dict[str, list[Path]] = {"evtx": [], "registry": [], "prefetch": [], "mft": []}
 
-    files = {
-        "evtx": [],
-        "registry": [],
-        "prefetch": [],
-        "mft": [],
-    }
+    if not target_path.is_dir():
+        return files
 
-    # Search through the main directory
     for item in target_path.rglob("*"):
-        if not item.is_file():
+        try:
+            if not item.is_file():
+                continue
+            # Read the header once per file rather than reopening for each signature
+            with item.open("rb") as f:
+                header = f.read(_HEADER_READ_SIZE)
+        except OSError:
             continue
 
-        for category, magic, offset in SIGNATURES:
-            if testFileMagic(item, magic, offset):
-                files[category].append(item)
-                break  # Stop checking once a match is found
-            
+        category = _match_header(header)
+        if category:
+            files[category].append(item)
+
     return files

@@ -1,10 +1,12 @@
 import argparse
 import shutil
-from pathlib import Path
-from modules import scanner, preflight, triage
-from modules.parsers import evtxParser, registryParser, prefetchParser, mftParser
-from rich.console import Console
 import time
+from pathlib import Path
+
+from rich.console import Console
+
+from modules import preflight, scanner, triage
+from modules.parsers import evtxParser, mftParser, prefetchParser, registryParser
 
 console = Console(highlight=False)
 
@@ -15,23 +17,52 @@ PARSERS = {
     "mft": mftParser.parse,
 }
 
-def getValidDirectory(cli_path=None):
+
+def getValidDirectory(cli_path: str | None = None) -> Path | None:
     raw_path = cli_path
 
     while True:
         if not raw_path:
-            raw_path = input("Enter the full path of your investigation directory: ")
+            try:
+                raw_path = input("Enter the full path of your investigation directory: ")
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow][-] Cancelled.[/yellow]")
+                return None
 
         cleaned = raw_path.strip().strip('"').strip("'")
-        target = Path(cleaned)
-
-        if target.is_dir():
-            return target
+        if cleaned:
+            try:
+                target = Path(cleaned)
+                if target.is_dir():
+                    return target
+            except OSError:
+                pass
 
         console.print(f"[red][!] Error: '{cleaned}' is not a valid directory. Try again.\n")
         raw_path = None
 
-def main():
+
+def _prompt_parse_decision(category: str, file_count: int) -> str:
+    """Prompts the analyst whether to parse a category ('yes', 'no', or 'all')."""
+    console.print(f"\nThe program will now parse the following file type(s): [bold]{category.upper()}[/bold] ({file_count} files).")
+    while True:
+        try:
+            choice = input("Continue? [Y]es / [n]o / [a]ll: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print(f"\n[yellow][-] Skipping {category.upper()}.[/yellow]")
+            return "no"
+
+        if choice in ("", "y", "yes"):
+            return "yes"
+        if choice in ("n", "no"):
+            console.print(f"[yellow][-] Skipping {category.upper()}.[/yellow]")
+            return "no"
+        if choice in ("a", "all"):
+            return "all"
+        console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n / a.[/red]")
+
+
+def main() -> None:
     console.print("\ncleb's DFIR harness v1.0\n")
 
     parser = argparse.ArgumentParser(description="AI-Assisted Windows DFIR Harness")
@@ -45,14 +76,15 @@ def main():
         console.print("[red][!] Error: --skip-parse and --clear cannot be used together.[/red]")
         return
 
-    if not args.dry_run and not args.skip_parse:
-        if not preflight.ensure_ez_tools():
-            return
+    if not args.dry_run and not args.skip_parse and not preflight.ensure_ez_tools():
+        return
 
     main_directory = getValidDirectory(args.directory)
+    if main_directory is None:
+        return
     console.print(f"Main directory set to: {main_directory}\n")
 
-    base_output = Path("output") / main_directory.name
+    base_output = Path("output") / (main_directory.resolve().name or "case")
 
     if args.skip_parse:
         if not base_output.is_dir() or not any(base_output.rglob("*.csv")):
@@ -75,40 +107,24 @@ def main():
             console.print(f"{category.upper()}: {len(items)} files")
             time.sleep(0.05)
 
-        # HITL Parsing Loop
         parse_all = False
-
         for category, file_list in files.items():
             if not file_list or category not in PARSERS:
                 continue
 
             if not parse_all:
-                console.print(f"\nThe program will now parse the following file type(s): [bold]{category.upper()}[/bold] ({len(file_list)} files).")
-                skip_category = False
-
-                while True:
-                    choice = input("Continue? [Y]es / [n]o / [a]ll: ").strip().lower()
-                    if choice in ("", "y", "yes"):
-                        break
-                    elif choice in ("n", "no"):
-                        console.print(f"[yellow][-] Skipping {category.upper()}.[/yellow]")
-                        skip_category = True
-                        break
-                    elif choice in ("a", "all"):
-                        parse_all = True
-                        break
-                    else:
-                        console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n / a.[/red]")
-
-                if skip_category:
+                decision = _prompt_parse_decision(category, len(file_list))
+                if decision == "no":
                     continue
+                if decision == "all":
+                    parse_all = True
 
-            category_out = base_output / category
             console.print(f"[cyan][*] Running {category.upper()} parser...[/cyan]")
-            PARSERS[category](file_list, category_out, dry_run=args.dry_run)
+            PARSERS[category](file_list, base_output / category, dry_run=args.dry_run)
 
     if not args.dry_run:
         triage.run_triage(base_output, main_directory=main_directory)
+
 
 if __name__ == "__main__":
     main()
