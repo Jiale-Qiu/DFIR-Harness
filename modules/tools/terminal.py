@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from modules import toolbox
 from modules.common import safe_int
 from modules.llm_ui import confirm_terminal, declined_payload
 
@@ -44,9 +45,15 @@ def get_terminal_env_summary() -> str:
     else:
         shell_info = "/bin/sh (POSIX sh)"
 
-    found = [tool for tool in _PROBE_TOOLS if shutil.which(tool)]
+    env = toolbox.build_env()
+    found = [tool for tool in _PROBE_TOOLS if shutil.which(tool, path=env.get("PATH"))]
     found.append(f"python ({Path(sys.executable).name})")
-    return f"OS: {os_label} | Shell: {shell_info} | Available CLI tools: {', '.join(found)}"
+    summary = f"OS: {os_label} | Shell: {shell_info} | Available CLI tools: {', '.join(found)}"
+
+    registered = [d for d in toolbox.load() if os.path.isdir(d)]
+    if registered:
+        summary += f" | Custom tool dirs on PATH: {', '.join(registered)}"
+    return summary
 
 
 _PS_BIN = _get_windows_ps()
@@ -119,6 +126,7 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
             exec_args,
             shell=use_shell,
             cwd=str(cwd),
+            env=toolbox.build_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",

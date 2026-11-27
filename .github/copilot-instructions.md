@@ -34,6 +34,12 @@ Pipeline (see `main.py`):
    "handler": fn}]` where handlers take `(args, ctx)` and return a dict. Current tools:
    `query_duckdb`, `run_terminal`, `read_file`, `list_directory`, `calculate`,
    `decode_base64`, `decode_hex`, `xor_decode`, `open_timeline_explorer`.
+9. `modules/toolbox.py` — persistent registry of analyst-supplied tool directories
+   (`~/.dfir-harness/toolbox.json`, override with `DFIR_TOOLBOX_CONFIG`) plus pip package
+   discovery. Registered directories are prepended to PATH (process-wide and per
+   `run_terminal` subprocess); installed packages are auto-detected via
+   `importlib.metadata`. The CLI manages it through `/tools list|add|remove|pip install`,
+   and the system prompt lists what is available.
 
 `ctx` passed to handlers: `con` (DuckDB connection), `mounted_views`, `base_output`
 (parsed CSV root), `main_directory` (raw evidence root), `state` (reasoning, thinking
@@ -68,6 +74,10 @@ py -3 main.py "C:\cases\case01" --skip-parse   # reuse existing CSVs in output/<
 
 py -3 main.py --help
 
+# Inside the investigation CLI: register extra CLI tools / pip packages (persisted)
+#   /tools add C:\tools\hayabusa
+#   /tools pip install yara-python
+
 # Syntax/import smoke check (no tests exist)
 py -3 -m compileall -q main.py modules
 ```
@@ -100,7 +110,11 @@ against evidence to "test" a code change.
   the `REGISTER` schema/handler contract and return a dict.
 - **Handle failures defensively.** Subprocess/OS/DB failures are caught and surfaced with
   a short Rich message rather than raised to the top level, matching `run_ez_command` and
-  `mount_views`.
+  `mount_views`. The same applies to `modules/toolbox.py`: a missing or corrupt config must
+  load as empty, and PATH edits must never raise.
+- **Keep persisted user config backward compatible.** `modules/toolbox.py` owns
+  `~/.dfir-harness/toolbox.json`; read unknown/missing keys with defaults and stay
+  stdlib-only there.
 - **Bounds stay bounded.** Tool output fed back to the LLM must remain truncated by the
   existing `MAX_*` constants; do not raise caps without an explicit request.
 - **No speculative tests or docs.** Only add tests/docs for behavior the change

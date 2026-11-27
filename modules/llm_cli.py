@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import duckdb
@@ -22,6 +23,7 @@ from modules.pane_bridge import (
 )
 from modules.tools import TOOL_SCHEMAS, execute_tool, list_tools
 from modules.tools.duckdb_sql import execute_sql
+from modules import toolbox
 
 VALID_LEVELS = ("low", "medium", "high", "off")
 VALID_THINKING_MODES = ("collapse", "full", "off")
@@ -135,6 +137,17 @@ def _build_system_prompt(
                 f"{source_tree}\n```\n\n"
             )
 
+    toolbelt = toolbox.describe_tools()
+    toolbelt_section = (
+        "### Analyst-Registered Extra Tools\n"
+        f"{toolbelt}\n"
+        "Everything listed above is already usable through `run_terminal` "
+        "(Python packages run as `python -m <module>` or via a script).\n"
+        "To add more, the analyst runs `/tools add <directory>` or `/tools pip install <package>`.\n\n"
+        if toolbelt
+        else ""
+    )
+
     return (
         "You are an expert Windows DFIR analyst assisting a human investigator.\n"
         "Use your registered tools to query DuckDB artifacts, inspect case files, decode obfuscated payloads, "
@@ -143,6 +156,7 @@ def _build_system_prompt(
         + "\n".join(schema_lines)
         + "\n\n"
         + env_section
+        + toolbelt_section
         + source_section
         + f'### Parsed Output Directory Tree (`root="output"`, {base_resolved})\n```\n'
         + output_tree
@@ -164,7 +178,8 @@ def _build_system_prompt(
         "simple text/hex slices, but use `run_terminal` when CLI tools are more effective (e.g., file hashing, "
         "`Select-String` multi-file search, SQLite/archive/PE inspection, or unparsed artifacts). Write valid "
         'PowerShell syntax, set `root` (`"source"` or `"output"`) appropriately, use relative case paths, '
-        "and keep commands read-only and output-bounded.\n"
+        "and keep commands read-only and output-bounded. Directories registered with `/tools add` and "
+        "packages installed with `/tools pip install` are already on PATH for every command.\n"
         "7. If the analyst declines a tool action, respect the decision. If `analyst_feedback` is included in "
         "the tool result, pivot immediately to follow that guidance instead of repeating the declined call.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
@@ -249,6 +264,81 @@ def _set_enum_option(state: dict, key: str, label: str, arg: str, valid: tuple[s
         console.print(f"[cyan][*] {label} set to: {val}[/cyan]\n")
     else:
         console.print(f"[yellow][!] Current: {state[key]} | Usage: /{key.replace('_mode', '')} <{'|'.join(valid)}>[/yellow]\n")
+
+
+def _refresh_system_prompt(ctx: dict, schemas: dict, messages: list[dict]) -> None:
+    """Rebuilds the system prompt so newly registered tools appear in the next turn."""
+    messages[0] = {
+        "role": "system",
+        "content": _build_system_prompt(schemas, ctx["base_output"], ctx.get("main_directory")),
+    }
+
+
+def _print_toolbox() -> None:
+    """Lists registered tool directories, installed pip packages, and in-process AI tools."""
+    config = toolbox.load()
+    table = Table(title=f"Registered Extra Tools ({toolbox.config_path()})")
+    table.add_column("#", justify="right", style="bold cyan")
+    table.add_column("Tool directory")
+
+    for idx, directory in enumerate(config, start=1):
+        suffix = "" if os.path.isdir(directory) else "  [red](missing)[/red]"
+        table.add_row(str(idx), f"{directory}{suffix}")
+
+    if table.row_count:
+        console.print(table)
+    else:
+        console.print("[yellow][!] No extra tool directories. Add one with /tools add <directory>.[/yellow]")
+
+    packages = toolbox.installed_packages(refresh=True)
+    if packages:
+        listed = ", ".join(packages)
+        console.print(f"\n[cyan][*] Installed pip packages ({len(packages)}):[/cyan]\n{listed}\n")
+    else:
+        console.print("\n[yellow][!] Could not enumerate installed pip packages.[/yellow]\n")
+
+    console.print(f"[cyan][*] Loaded AI tools:[/cyan] {', '.join(list_tools())}\n")
+
+
+def _handle_tools_command(arg: str, ctx: dict, schemas: dict, messages: list[dict]) -> None:
+    """Handles /tools [list|add <dir>|remove <dir|#>|pip install <packages>]."""
+    sub, _, rest = arg.partition(" ")
+    sub = sub.lower()
+    rest = rest.strip()
+
+    if sub in ("", "list"):
+        _print_toolbox()
+        return
+
+    if sub == "add":
+        if not rest:
+            console.print("[yellow][!] Usage: /tools add <directory>[/yellow]\n")
+            return
+        ok, message = toolbox.add_directory(rest)
+    elif sub in ("remove", "rm"):
+        if not rest:
+            console.print("[yellow][!] Usage: /tools remove <directory|#>[/yellow]\n")
+            return
+        ok, message = toolbox.remove_directory(rest)
+    elif sub in ("pip", "install"):
+        names = rest.removeprefix("install").split()
+        if not names:
+            console.print("[yellow][!] Usage: /tools pip install <package> [...] (or /tools pip <package>)[/yellow]\n")
+            return
+        console.print(f"[cyan][*] Installing {', '.join(names)} into {sys.executable} ...[/cyan]")
+        ok, message = toolbox.install_packages(names)
+    else:
+        console.print(
+            "[yellow][!] Usage: /tools [list] | /tools add <dir> | /tools remove <dir|#> | "
+            "/tools pip install <pkgs>[/yellow]\n"
+        )
+        return
+
+    tag = "green" if ok else "red"
+    prefix = "+" if ok else "!"
+    console.print(f"[{tag}][{prefix}] {message}[/{tag}]\n")
+    if ok:
+        _refresh_system_prompt(ctx, schemas, messages)
 
 
 def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: list[dict]) -> bool:
@@ -354,7 +444,7 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         return True
 
     if cmd_lower == "/tools":
-        console.print(f"[cyan][*] Loaded AI tools:[/cyan] {', '.join(list_tools())}\n")
+        _handle_tools_command(arg, ctx, schemas, messages)
         return True
 
     if cmd_lower == "/clear":
@@ -473,6 +563,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
         console.print("[red][!] No queryable DuckDB schemas found.[/red]")
         return
 
+    toolbox.apply_environment()
     active_tools = list_tools()
     client = OpenAI()
     pane_path = get_session_state_path()
@@ -498,6 +589,9 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
         f"[dim]Model: {model} | Views: {', '.join(sorted(schemas))} | "
         f"Tools: {len(active_tools)} loaded | Type /pane for split viewer or /help for commands[/dim]\n"
     )
+    registered = [d for d in toolbox.load() if os.path.isdir(d)]
+    if registered:
+        console.print(f"[dim]Extra tool dirs: {', '.join(registered)}[/dim]")
 
     try:
         while True:
