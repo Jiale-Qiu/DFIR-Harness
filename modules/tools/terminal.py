@@ -50,7 +50,7 @@ def get_terminal_env_summary() -> str:
     found.append(f"python ({Path(sys.executable).name})")
     summary = f"OS: {os_label} | Shell: {shell_info} | Available CLI tools: {', '.join(found)}"
 
-    registered = [d for d in toolbox.load() if os.path.isdir(d)]
+    registered = [d for d in toolbox.load_directories() if os.path.isdir(d)]
     if registered:
         summary += f" | Custom tool dirs on PATH: {', '.join(registered)}"
     return summary

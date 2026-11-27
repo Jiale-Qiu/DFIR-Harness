@@ -142,8 +142,8 @@ def _build_system_prompt(
         "### Analyst-Registered Extra Tools\n"
         f"{toolbelt}\n"
         "Everything listed above is already usable through `run_terminal` "
-        "(Python packages run as `python -m <module>` or via a script).\n"
-        "To add more, the analyst runs `/tools add <directory>` or `/tools pip install <package>`.\n\n"
+        "(registered directories are on PATH; registered files must be called by absolute path).\n"
+        "To add more, the analyst runs `/tools add <directory|file>` or `/tools pip install <package>`.\n\n"
         if toolbelt
         else ""
     )
@@ -178,8 +178,9 @@ def _build_system_prompt(
         "simple text/hex slices, but use `run_terminal` when CLI tools are more effective (e.g., file hashing, "
         "`Select-String` multi-file search, SQLite/archive/PE inspection, or unparsed artifacts). Write valid "
         'PowerShell syntax, set `root` (`"source"` or `"output"`) appropriately, use relative case paths, '
-        "and keep commands read-only and output-bounded. Directories registered with `/tools add` and "
-        "packages installed with `/tools pip install` are already on PATH for every command.\n"
+        "and keep commands read-only and output-bounded. Directories registered with `/tools add` are on "
+        "PATH, registered tool files must be called by absolute path (quote paths with spaces), and "
+        "packages installed with `/tools pip install` are importable.\n"
         "7. If the analyst declines a tool action, respect the decision. If `analyst_feedback` is included in "
         "the tool result, pivot immediately to follow that guidance instead of repeating the declined call.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
@@ -275,20 +276,24 @@ def _refresh_system_prompt(ctx: dict, schemas: dict, messages: list[dict]) -> No
 
 
 def _print_toolbox() -> None:
-    """Lists registered tool directories, installed pip packages, and in-process AI tools."""
-    config = toolbox.load()
+    """Lists registered tool directories/files, installed pip packages, and in-process AI tools."""
+    directories = toolbox.load_directories()
+    files = toolbox.load_files()
     table = Table(title=f"Registered Extra Tools ({toolbox.config_path()})")
     table.add_column("#", justify="right", style="bold cyan")
-    table.add_column("Tool directory")
+    table.add_column("Type")
+    table.add_column("Path")
 
-    for idx, directory in enumerate(config, start=1):
-        suffix = "" if os.path.isdir(directory) else "  [red](missing)[/red]"
-        table.add_row(str(idx), f"{directory}{suffix}")
+    entries = [(d, "dir", os.path.isdir(d)) for d in directories]
+    entries += [(f, "file", os.path.isfile(f)) for f in files]
+    for idx, (path, kind, exists) in enumerate(entries, start=1):
+        suffix = "" if exists else "  [red](missing)[/red]"
+        table.add_row(str(idx), kind, f"{path}{suffix}")
 
     if table.row_count:
         console.print(table)
     else:
-        console.print("[yellow][!] No extra tool directories. Add one with /tools add <directory>.[/yellow]")
+        console.print("[yellow][!] No extra tools registered. Add one with /tools add <path>.[/yellow]")
 
     packages = toolbox.installed_packages(refresh=True)
     if packages:
@@ -301,7 +306,7 @@ def _print_toolbox() -> None:
 
 
 def _handle_tools_command(arg: str, ctx: dict, schemas: dict, messages: list[dict]) -> None:
-    """Handles /tools [list|add <dir>|remove <dir|#>|pip install <packages>]."""
+    """Handles /tools [list|add <path>|remove <path|#>|pip install <packages>]."""
     sub, _, rest = arg.partition(" ")
     sub = sub.lower()
     rest = rest.strip()
@@ -312,14 +317,14 @@ def _handle_tools_command(arg: str, ctx: dict, schemas: dict, messages: list[dic
 
     if sub == "add":
         if not rest:
-            console.print("[yellow][!] Usage: /tools add <directory>[/yellow]\n")
+            console.print("[yellow][!] Usage: /tools add <directory|file>[/yellow]\n")
             return
-        ok, message = toolbox.add_directory(rest)
+        ok, message = toolbox.add_path(rest)
     elif sub in ("remove", "rm"):
         if not rest:
-            console.print("[yellow][!] Usage: /tools remove <directory|#>[/yellow]\n")
+            console.print("[yellow][!] Usage: /tools remove <directory|file|#>[/yellow]\n")
             return
-        ok, message = toolbox.remove_directory(rest)
+        ok, message = toolbox.remove_path(rest)
     elif sub in ("pip", "install"):
         names = rest.removeprefix("install").split()
         if not names:
@@ -329,7 +334,7 @@ def _handle_tools_command(arg: str, ctx: dict, schemas: dict, messages: list[dic
         ok, message = toolbox.install_packages(names)
     else:
         console.print(
-            "[yellow][!] Usage: /tools [list] | /tools add <dir> | /tools remove <dir|#> | "
+            "[yellow][!] Usage: /tools [list] | /tools add <dir|file> | /tools remove <dir|file|#> | "
             "/tools pip install <pkgs>[/yellow]\n"
         )
         return
@@ -589,9 +594,12 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
         f"[dim]Model: {model} | Views: {', '.join(sorted(schemas))} | "
         f"Tools: {len(active_tools)} loaded | Type /pane for split viewer or /help for commands[/dim]\n"
     )
-    registered = [d for d in toolbox.load() if os.path.isdir(d)]
+    registered = [d for d in toolbox.load_directories() if os.path.isdir(d)]
     if registered:
         console.print(f"[dim]Extra tool dirs: {', '.join(registered)}[/dim]")
+    registered_files = [f for f in toolbox.load_files() if os.path.isfile(f)]
+    if registered_files:
+        console.print(f"[dim]Extra tool files: {len(registered_files)} registered (see /tools)[/dim]")
 
     try:
         while True:

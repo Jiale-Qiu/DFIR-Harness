@@ -1,4 +1,4 @@
-"""Persistent registry of analyst-provided tool directories, plus pip package discovery."""
+"""Persistent registry of analyst-provided tool directories/files, plus pip package discovery."""
 
 from __future__ import annotations
 
@@ -25,23 +25,37 @@ def config_path() -> Path:
     return Path.home() / ".dfir-harness" / "toolbox.json"
 
 
-def load() -> list[str]:
-    """Loads registered tool directories, tolerating a missing/corrupt config."""
+def _read_raw() -> dict:
     try:
         raw = json.loads(config_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _str_list(raw: dict, key: str) -> list[str]:
+    values = raw.get(key, [])
+    if not isinstance(values, list):
         return []
-
-    if not isinstance(raw, dict):
-        return []
-    return [d for d in raw.get("directories", []) if isinstance(d, str)]
+    return [v for v in values if isinstance(v, str)]
 
 
-def _save(directories: list[str]) -> None:
+def load_directories() -> list[str]:
+    """Returns registered tool directories, tolerating a missing/corrupt config."""
+    return _str_list(_read_raw(), "directories")
+
+
+def load_files() -> list[str]:
+    """Returns registered individual tool files, tolerating a missing/corrupt config."""
+    return _str_list(_read_raw(), "files")
+
+
+def _save(directories: list[str], files: list[str]) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps({"directories": directories}, indent=2), encoding="utf-8")
+    payload = {"directories": directories, "files": files}
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     try:
         os.replace(tmp_path, path)
     finally:
@@ -52,57 +66,76 @@ def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
 
 
-def add_directory(raw: str) -> tuple[bool, str]:
-    """Registers a tool directory and adds it to this session's PATH."""
+def add_path(raw: str) -> tuple[bool, str]:
+    """Registers a tool directory (added to PATH) or a single tool file (path only)."""
     target = Path(os.path.expanduser(raw.strip().strip('"').strip("'")))
-    if not target.is_dir():
-        return False, f"'{raw}' is not a directory."
+    if not target.exists():
+        return False, f"'{raw}' is not an existing file or directory."
 
-    config = load()
     resolved = str(target.resolve())
-    if any(_norm(existing) == _norm(resolved) for existing in config):
-        return False, f"'{resolved}' is already registered."
 
-    config.append(resolved)
-    try:
-        _save(config)
-    except OSError as exc:
-        return False, f"Could not save toolbox config: {exc}"
+    if target.is_dir():
+        directories = load_directories()
+        if any(_norm(existing) == _norm(resolved) for existing in directories):
+            return False, f"'{resolved}' is already registered."
+        directories.append(resolved)
+        try:
+            _save(directories, load_files())
+        except OSError as exc:
+            return False, f"Could not save toolbox config: {exc}"
+        apply_environment()
+        return True, f"Registered tool directory: {resolved}"
 
-    apply_environment()
-    return True, f"Registered tool directory: {resolved}"
+    if target.is_file():
+        files = load_files()
+        if any(_norm(existing) == _norm(resolved) for existing in files):
+            return False, f"'{resolved}' is already registered."
+        files.append(resolved)
+        try:
+            _save(load_directories(), files)
+        except OSError as exc:
+            return False, f"Could not save toolbox config: {exc}"
+        return True, f"Registered tool file: {resolved}"
+
+    return False, f"'{raw}' is not a file or directory."
 
 
-def remove_directory(selector: str) -> tuple[bool, str]:
-    """Removes a registered directory by path or 1-based index from the /tools listing."""
-    config = load()
+def remove_path(selector: str) -> tuple[bool, str]:
+    """Removes a registered directory or file by path or 1-based index from the /tools listing."""
+    directories = load_directories()
+    files = load_files()
     selector = selector.strip()
     match: str | None = None
 
     if selector.isdigit():
+        combined = [*directories, *files]
         index = int(selector) - 1
-        if 0 <= index < len(config):
-            match = config[index]
+        if 0 <= index < len(combined):
+            match = combined[index]
     else:
-        match = next((d for d in config if _norm(d) == _norm(selector)), None)
+        match = next((p for p in (*directories, *files) if _norm(p) == _norm(selector)), None)
 
     if match is None:
-        return False, f"No registered directory matches '{selector}'. Run /tools to list them."
+        return False, f"No registered entry matches '{selector}'. Run /tools to list them."
 
-    config.remove(match)
+    if match in directories:
+        directories.remove(match)
+    else:
+        files.remove(match)
+
     try:
-        _save(config)
+        _save(directories, files)
     except OSError as exc:
         return False, f"Could not save toolbox config: {exc}"
 
     apply_environment()
-    return True, f"Removed tool directory: {match}"
+    return True, f"Removed: {match}"
 
 
 def build_env() -> dict[str, str]:
     """Returns a copy of the environment with registered directories prepended to PATH."""
     env = os.environ.copy()
-    directories = [d for d in load() if os.path.isdir(d)]
+    directories = [d for d in load_directories() if os.path.isdir(d)]
     if not directories:
         return env
 
@@ -127,7 +160,7 @@ def _base_path() -> str:
 
 def apply_environment() -> None:
     """Puts exactly the registered directories on this process PATH so children inherit them."""
-    directories = [d for d in load() if os.path.isdir(d)]
+    directories = [d for d in load_directories() if os.path.isdir(d)]
     base = _base_path()
     os.environ["PATH"] = os.pathsep.join([*directories, base]) if directories else base
 
@@ -197,8 +230,9 @@ def install_packages(raw_names: list[str]) -> tuple[bool, str]:
 
 
 def describe_tools() -> str:
-    """Builds the prompt block describing registered directories and installed packages."""
-    directories = load()
+    """Builds the prompt block describing registered tools and installed packages."""
+    directories = load_directories()
+    files = load_files()
     lines: list[str] = []
 
     installed_dirs = [d for d in directories if os.path.isdir(d)]
@@ -210,7 +244,21 @@ def describe_tools() -> str:
             lines.append(f"- {directory}: {detail}")
         missing = [d for d in directories if not os.path.isdir(d)]
         if missing:
-            lines.append(f"- Missing/unavailable: {', '.join(missing)}")
+            lines.append(f"- Missing/unavailable directories: {', '.join(missing)}")
+
+    present_files = [f for f in files if os.path.isfile(f)]
+    if present_files:
+        lines.append(
+            "Registered tool files (individual executables/scripts, NOT on PATH - call them by absolute "
+            "path and quote paths containing spaces, e.g. "
+            '`& "C:\\Program Files\\7-Zip\\7z.exe" l archive.7z`):'
+        )
+        for file in present_files:
+            hint = " (run with python)" if file.lower().endswith((".py", ".pyw")) else ""
+            lines.append(f"- {file}{hint}")
+        missing_files = [f for f in files if not os.path.isfile(f)]
+        if missing_files:
+            lines.append(f"- Missing/unavailable files: {', '.join(missing_files)}")
 
     packages = installed_packages()
     if packages:

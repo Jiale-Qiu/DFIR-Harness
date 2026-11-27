@@ -34,12 +34,13 @@ Pipeline (see `main.py`):
    "handler": fn}]` where handlers take `(args, ctx)` and return a dict. Current tools:
    `query_duckdb`, `run_terminal`, `read_file`, `list_directory`, `calculate`,
    `decode_base64`, `decode_hex`, `xor_decode`, `open_timeline_explorer`.
-9. `modules/toolbox.py` — persistent registry of analyst-supplied tool directories
-   (`~/.dfir-harness/toolbox.json`, override with `DFIR_TOOLBOX_CONFIG`) plus pip package
-   discovery. Registered directories are prepended to PATH (process-wide and per
-   `run_terminal` subprocess); installed packages are auto-detected via
-   `importlib.metadata`. The CLI manages it through `/tools list|add|remove|pip install`,
-   and the system prompt lists what is available.
+9. `modules/toolbox.py` — persistent registry of analyst-supplied tool directories *and*
+   individual tool files (`~/.dfir-harness/toolbox.json`, override with `DFIR_TOOLBOX_CONFIG`)
+   plus pip package discovery. Registered directories are prepended to PATH (process-wide and
+   per `run_terminal` subprocess); registered files are listed by absolute path only (no PATH
+   change) so a shared folders like `C:\Program Files\7-Zip` exposes just the chosen exe.
+   Installed packages are auto-detected via `importlib.metadata`. The CLI manages it through
+   `/tools list|add|remove|pip install`, and the system prompt lists what is available.
 
 `ctx` passed to handlers: `con` (DuckDB connection), `mounted_views`, `base_output`
 (parsed CSV root), `main_directory` (raw evidence root), `state` (reasoning, thinking
@@ -75,7 +76,8 @@ py -3 main.py "C:\cases\case01" --skip-parse   # reuse existing CSVs in output/<
 py -3 main.py --help
 
 # Inside the investigation CLI: register extra CLI tools / pip packages (persisted)
-#   /tools add C:\tools\hayabusa
+#   /tools add C:\tools\hayabusa            (directory -> added to PATH)
+#   /tools add "C:\Program Files\7-Zip\7z.exe"   (single file -> absolute path only)
 #   /tools pip install yara-python
 
 # Syntax/import smoke check (no tests exist)
