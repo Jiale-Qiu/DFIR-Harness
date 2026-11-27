@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import platform
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from modules.common import safe_int
@@ -12,6 +16,38 @@ DEFAULT_TIMEOUT_SEC = 30
 MAX_TIMEOUT_SEC = 120
 MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
+
+_PROBE_TOOLS = (
+    "pwsh", "powershell", "certutil", "findstr", "where",
+    "rg", "grep", "awk", "sed", "strings", "xxd", "hexdump",
+    "sha256sum", "shasum", "sqlite3", "7z", "tar", "file",
+)
+
+
+def _get_windows_ps() -> str | None:
+    """Returns the preferred PowerShell executable on Windows (PowerShell 7+ first, then 5.1)."""
+    return shutil.which("pwsh") or shutil.which("powershell") if os.name == "nt" else None
+
+
+def get_terminal_env_summary() -> str:
+    """Builds a concise description of the host OS, target shell, and available CLI tools."""
+    os_label = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    ps_bin = _get_windows_ps()
+
+    if os.name == "nt":
+        if ps_bin:
+            shell_info = f"PowerShell ({Path(ps_bin).name} -NoProfile -NonInteractive -Command)"
+        else:
+            shell_info = f"{Path(os.environ.get('COMSPEC', 'cmd.exe')).name} (PowerShell not found on PATH)"
+    else:
+        shell_info = "/bin/sh (POSIX sh; use `bash -c` if bash-specific syntax is needed)"
+
+    found = [tool for tool in _PROBE_TOOLS if shutil.which(tool)]
+    found.append(f"python ({Path(sys.executable).name})")
+    return f"OS: {os_label} | Shell: {shell_info} | Available CLI tools: {', '.join(found)}"
+
+
+_ENV_SUMMARY = get_terminal_env_summary()
 
 
 def _cap(raw: str | bytes | None, limit: int) -> tuple[str, bool]:
@@ -57,10 +93,21 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     if not decision:
         return declined_payload("Analyst declined terminal command.", decision.feedback)
 
+    # On Windows, invoke PowerShell directly (shell=False) so cmd.exe does not mangle quotes or pipes.
+    ps_bin = _get_windows_ps()
+    if ps_bin:
+        exec_args: str | list[str] = [ps_bin, "-NoProfile", "-NonInteractive", "-Command", command]
+        use_shell = False
+        shell_name = Path(ps_bin).name
+    else:
+        exec_args = command
+        use_shell = True
+        shell_name = Path(os.environ.get("COMSPEC", "cmd.exe")).name if os.name == "nt" else "/bin/sh"
+
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
+            exec_args,
+            shell=use_shell,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -78,6 +125,7 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     stdout, out_trunc = _cap(proc.stdout, MAX_STDOUT_CHARS)
     stderr, err_trunc = _cap(proc.stderr, MAX_STDERR_CHARS)
     return {
+        "shell": shell_name,
         "exit_code": proc.returncode,
         "stdout": stdout,
         "stderr": stderr,
@@ -93,6 +141,7 @@ REGISTER = [
                 "name": "run_terminal",
                 "description": (
                     "Propose a local shell command for explicit human approval inside the case directory. "
+                    f"[{_ENV_SUMMARY}] "
                     "Use query_duckdb for mounted CSV views and read_file for simple text/hex slices, "
                     "but use run_terminal whenever CLI utilities are better suited—such as hashing files, "
                     "running strings/regex searches across artifacts, inspecting SQLite DBs/archives/PE headers, "
@@ -103,7 +152,7 @@ REGISTER = [
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The exact shell command to run inside the selected case directory.",
+                            "description": "The exact command formatted for the shell shown in the tool description.",
                         },
                         "root": {
                             "type": "string",
