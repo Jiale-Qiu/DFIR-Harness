@@ -9,7 +9,7 @@ import duckdb
 
 from modules.llm_ui import confirm_sql, console, print_result_table
 
-MAX_SQL_ROWS = 100
+MAX_SQL_ROWS = 50
 MAX_LLM_CELL_CHARS = 500
 MAX_LLM_PAYLOAD_CHARS = 24_000
 
@@ -190,7 +190,7 @@ REGISTER = [
                 "name": "query_duckdb",
                 "description": (
                     "Execute a read-only DuckDB SQL query against the mounted forensic artifact views. "
-                    "Always select only the columns you need and include LIMIT 50 or LIMIT 100 on non-aggregated queries."
+                    "Always select only the columns you need and include LIMIT 25 or LIMIT 50 on non-aggregated queries."
                 ),
                 "parameters": {
                     "type": "object",

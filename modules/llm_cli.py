@@ -157,7 +157,7 @@ def _build_system_prompt(
         "   - Compare IDs as strings (e.g., `EventId = '4624'`).\n"
         "   - Use `TRY_CAST(col AS BIGINT)` for numeric sorting/filtering.\n"
         "   - Use `ILIKE` for case-insensitive Windows path/filename matching.\n"
-        "2. Always include `LIMIT 50` or `LIMIT 100` on non-aggregated queries (output caps at 100 rows).\n"
+        "2. Always include `LIMIT 25` or `LIMIT 50` on non-aggregated queries (output caps at 50 rows).\n"
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
         "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
         "5. File Inspection (`read_file` / `list_directory`): Use `read_file` to inspect logs, scripts, JSON, "
@@ -195,9 +195,9 @@ def _stream_completion(
         "max_tokens": MAX_TOKENS,
         "stream": True,
     }
-    if TOOL_SCHEMAS:
+    if TOOL_SCHEMAS and allow_tools:
         request_kwargs["tools"] = TOOL_SCHEMAS
-        request_kwargs["tool_choice"] = "auto" if allow_tools else "none"
+        request_kwargs["tool_choice"] = "auto"
     if effective_reasoning != "off":
         request_kwargs["extra_body"] = {"reasoning_effort": effective_reasoning}
 
@@ -432,17 +432,32 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
 
             try:
                 empty_retries = 0
+                last_reasoning = ""
                 round_idx = 0
                 while round_idx < MAX_TOOL_ROUNDS:
                     # Reserve the final round (and empty-reply retries) for synthesis
                     allow_tools = (round_idx < (MAX_TOOL_ROUNDS - 1)) and (empty_retries == 0)
-                    retry_reasoning = (
-                        "low" if (empty_retries > 0 and ctx["state"]["reasoning"] != "off") else None
-                    )
+                    retry_reasoning = "off" if empty_retries > 0 else None
+
+                    call_messages = messages
+                    if empty_retries > 0:
+                        nudge = (
+                            "Tool calling is disabled. Do not output chain-of-thought reasoning or "
+                            "attempt tool calls. Write the final DFIR response for the investigator "
+                            "now based on the evidence gathered so far."
+                        )
+                        if last_reasoning.strip():
+                            trimmed_reasoning = last_reasoning.strip()[-6000:]
+                            nudge += (
+                                "\n\nSynthesize your prior analysis below into a clear final answer:\n"
+                                f"<prior_analysis>\n{trimmed_reasoning}\n</prior_analysis>"
+                            )
+                        call_messages = [*messages, {"role": "user", "content": nudge}]
+
                     reply, reasoning, tool_calls, finish_reason = _stream_completion(
                         client,
                         model,
-                        messages,
+                        call_messages,
                         ctx["state"],
                         allow_tools=allow_tools,
                         reasoning_override=retry_reasoning,
@@ -458,6 +473,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
 
                         if empty_retries < 1:
                             empty_retries += 1
+                            last_reasoning = reasoning
                             console.print(
                                 f"[yellow][*] Model returned no final answer "
                                 f"(finish_reason={finish_reason or 'unknown'}) — retrying synthesis...[/yellow]"
@@ -468,9 +484,10 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
                             f"[yellow][!] Model still returned no final answer "
                             f"(finish_reason={finish_reason or 'unknown'}).[/yellow]"
                         )
-                        if reasoning.strip() and ctx["state"]["thinking_mode"] != "full":
+                        fallback_reasoning = reasoning.strip() or last_reasoning.strip()
+                        if fallback_reasoning and ctx["state"]["thinking_mode"] != "full":
                             console.print("[dim]--- Captured reasoning (no final reply emitted) ---[/dim]")
-                            console.print(reasoning.strip(), style="dim")
+                            console.print(fallback_reasoning, style="dim")
                         print()
 
                         if round_idx > 0:
@@ -478,7 +495,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
                             messages.append(
                                 {
                                     "role": "assistant",
-                                    "content": reasoning.strip() or "[No final summary returned]",
+                                    "content": fallback_reasoning or "[No final summary returned]",
                                 }
                             )
                         else:
@@ -486,6 +503,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
                         break
 
                     empty_retries = 0
+                    last_reasoning = ""
                     messages.append({"role": "assistant", "content": reply or "", "tool_calls": tool_calls})
 
                     for tc in tool_calls:

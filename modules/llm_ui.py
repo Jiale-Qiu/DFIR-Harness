@@ -250,7 +250,7 @@ def print_help():
     console.print(table)
 
 
-def print_result_table(entry: dict, max_rows: int = 100):
+def print_result_table(entry: dict, max_rows: int = 50):
     """Renders a cached query result entry as a Rich Table."""
     rows = entry["rows"]
     columns = entry["columns"]
