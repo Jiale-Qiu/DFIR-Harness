@@ -136,10 +136,10 @@ def _build_system_prompt(
         "exists in both trees. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
         "slices rather than trying to read whole files. Never use `read_file` on large CSVs that are already "
         "mounted in DuckDB.\n"
-        "6. Terminal Execution (`run_terminal`) — STRICT LAST RESORT ONLY: Only propose a terminal command "
-        "when NO other registered tool (DuckDB SQL, `read_file`, `list_directory`, decoders, etc.) can complete "
-        'the task. Always state in `reason` why built-in tools cannot do it, set `root` (`"output"` or '
-        '`"source"`) if needed, and keep commands read-only and output-bounded.\n'
+        "6. Terminal Execution (`run_terminal`): Prefer `query_duckdb` for mounted views and `read_file` for "
+        "simple text/hex slices, but use `run_terminal` when CLI tools are more effective (e.g., file hashing, "
+        "`strings`, multi-file regex search, SQLite/archive/PE inspection, or unparsed artifacts). Set `root` "
+        '(`"output"` or `"source"`) appropriately and keep commands read-only and output-bounded.\n'
         "7. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "

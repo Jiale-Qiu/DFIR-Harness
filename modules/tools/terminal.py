@@ -1,4 +1,4 @@
-"""Last-resort HITL terminal command execution tool (never auto-accepted)."""
+"""HITL terminal command execution tool (always requires explicit analyst approval)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 from modules.common import safe_int
-from modules.llm_ui import confirm_terminal
+from modules.llm_ui import confirm_terminal, declined_payload
 
 DEFAULT_TIMEOUT_SEC = 30
 MAX_TIMEOUT_SEC = 120
@@ -14,43 +14,48 @@ MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
 
 
-def _decode_output(raw: str | bytes | None) -> str:
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return raw or ""
-
-
 def _cap(raw: str | bytes | None, limit: int) -> tuple[str, bool]:
-    text = _decode_output(raw)
+    """Decodes subprocess output safely and truncates it to fit LLM context limits."""
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else (raw or "")
     if len(text) <= limit:
         return text, False
     return text[:limit] + f"\n... [truncated {len(text) - limit:,} chars]", True
 
 
+def _resolve_cwd(ctx: dict, root: str) -> tuple[Path | None, str | None]:
+    """Resolves the working directory for 'output' or 'source' roots."""
+    if root == "output":
+        cwd = Path(ctx["base_output"]).resolve()
+    elif root == "source":
+        raw_main = ctx.get("main_directory")
+        if not raw_main:
+            return None, "Source investigation directory is not configured."
+        cwd = Path(raw_main).resolve()
+    else:
+        return None, f"Invalid root '{root}'. Use 'output' or 'source'."
+
+    if not cwd.is_dir():
+        return None, f"Working directory does not exist: {cwd}"
+    return cwd, None
+
+
 def _run_terminal(args: dict, ctx: dict) -> dict:
     command = str(args.get("command") or "").strip()
-    reason = str(args.get("reason") or "").strip()
-    root = str(args.get("root") or "output").strip().lower()
     if not command:
         return {"error": "Empty command."}
 
+    reason = str(args.get("reason") or "Run forensic CLI inspection").strip()
+    root = str(args.get("root") or "output").strip().lower()
     timeout = max(5, min(MAX_TIMEOUT_SEC, safe_int(args.get("timeout"), DEFAULT_TIMEOUT_SEC)))
-    if root == "source":
-        raw_main = ctx.get("main_directory")
-        if not raw_main:
-            return {"error": "Source investigation directory is not configured."}
-        cwd = Path(raw_main).resolve()
-    elif root == "output":
-        cwd = Path(ctx["base_output"]).resolve()
-    else:
-        return {"error": f"Invalid root '{root}'. Use 'output' or 'source'."}
 
-    if not cwd.is_dir():
-        return {"error": f"Working directory does not exist: {cwd}"}
+    cwd, err = _resolve_cwd(ctx, root)
+    if err or cwd is None:
+        return {"error": err or "Could not resolve working directory."}
 
-    # Always require explicit analyst approval — intentionally ignores auto_sql or any auto-accept flags.
-    if not confirm_terminal(reason=reason, command=command, cwd=str(cwd)):
-        return {"status": "declined", "message": "Analyst declined terminal command."}
+    # Always require explicit analyst approval — intentionally ignores auto_sql or auto-accept flags.
+    decision = confirm_terminal(reason=reason, command=command, cwd=str(cwd))
+    if not decision:
+        return declined_payload("Analyst declined terminal command.", decision.feedback)
 
     try:
         proc = subprocess.run(
@@ -65,12 +70,8 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
         )
     except subprocess.TimeoutExpired as exc:
         out, _ = _cap(exc.stdout, MAX_STDOUT_CHARS)
-        err, _ = _cap(exc.stderr, MAX_STDERR_CHARS)
-        return {
-            "error": f"Command timed out after {timeout}s.",
-            "stdout": out,
-            "stderr": err,
-        }
+        err_out, _ = _cap(exc.stderr, MAX_STDERR_CHARS)
+        return {"error": f"Command timed out after {timeout}s.", "stdout": out, "stderr": err_out}
     except OSError as exc:
         return {"error": f"Failed to execute command: {exc}"}
 
@@ -91,10 +92,11 @@ REGISTER = [
             "function": {
                 "name": "run_terminal",
                 "description": (
-                    "STRICT LAST RESORT ONLY. Proposes a local shell command for explicit human approval. "
-                    "Do NOT call this if DuckDB SQL, read_file, list_directory, or any other built-in tool "
-                    "can accomplish the task. You must explain in 'reason' why no other tool can do it. "
-                    "Prefer read-only, targeted commands with bounded output."
+                    "Propose a local shell command for explicit human approval inside the case directory. "
+                    "Use query_duckdb for mounted CSV views and read_file for simple text/hex slices, "
+                    "but use run_terminal whenever CLI utilities are better suited—such as hashing files, "
+                    "running strings/regex searches across artifacts, inspecting SQLite DBs/archives/PE headers, "
+                    "or parsing unmounted evidence. Keep commands read-only and output-bounded."
                 ),
                 "parameters": {
                     "type": "object",
@@ -107,14 +109,14 @@ REGISTER = [
                             "type": "string",
                             "enum": ["output", "source"],
                             "description": (
-                                "Which directory to use as the working directory: 'output' for the parsed output "
-                                "folder (default) or 'source' for the selected investigation directory."
+                                "Working directory: 'output' for the parsed output folder (default) "
+                                "or 'source' for the raw investigation directory."
                             ),
                             "default": "output",
                         },
                         "reason": {
                             "type": "string",
-                            "description": "Why this command is necessary and why no other built-in tool suffices.",
+                            "description": "Short explanation of what forensic question this command answers.",
                         },
                         "timeout": {
                             "type": "integer",

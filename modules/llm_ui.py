@@ -1,6 +1,6 @@
+from dataclasses import dataclass
 import os
 import threading
-from typing import TypeVar
 
 from rich import box
 from rich.columns import Columns
@@ -15,7 +15,31 @@ from rich.text import Text
 
 console = Console(highlight=False)
 
-_T = TypeVar("_T")
+
+@dataclass(frozen=True)
+class ConfirmDecision:
+    """Result of an analyst HITL prompt; truthy when approved, falsy when declined."""
+
+    approved: bool
+    choice: str
+    feedback: str = ""
+
+    def __bool__(self) -> bool:
+        return self.approved
+
+
+def declined_payload(default_message: str, feedback: str = "") -> dict[str, str]:
+    """Builds a standardized tool response so the LLM pivots on analyst feedback."""
+    if not feedback:
+        return {"status": "declined", "message": default_message}
+    return {
+        "status": "declined",
+        "analyst_feedback": feedback,
+        "message": (
+            f"{default_message} Analyst guidance: {feedback} "
+            "Follow this direction instead of repeating the declined request."
+        ),
+    }
 
 
 class StreamRenderer:
@@ -56,41 +80,33 @@ class StreamRenderer:
         self._live.stop()
         if exc_type is None:
             self._finalize_thinking(use_live=False)
-            self._flush_answer_tail(use_live=False)
+            if self._answer_buf.strip():
+                self._emit(Markdown(self._answer_buf, code_theme="monokai"), use_live=False)
+            self._answer_buf = ""
         return False
 
     def _emit(self, renderable, use_live: bool = True) -> None:
-        target = self._live.console if use_live else console
-        target.print(renderable)
+        (self._live.console if use_live else console).print(renderable)
 
     def add_thinking(self, token: str) -> None:
-        if self.thinking_mode == "off":
-            with self._lock:
-                self._thinking_chars += len(token)
-            return
-
-        if self.thinking_mode == "collapse":
-            with self._lock:
-                if self._thinking_chars == 0:
-                    token = token.lstrip()
-                    if not token:
-                        return
-                self._thinking_chars += len(token)
-                self._thinking_buf += token
-            return
-
-        # thinking_mode == "full": stream permanently into scrollback
         with self._lock:
             is_first = self._thinking_chars == 0
+            if is_first:
+                token = token.lstrip()
+                if not token:
+                    return
             self._thinking_chars += len(token)
-
-        if is_first:
-            token = token.lstrip()
-            if not token:
+            if self.thinking_mode == "collapse":
+                self._thinking_buf += token
                 return
-            if not self._thinking_header_printed:
-                self._emit(Text("[Thinking]", style="dim bold"))
-                self._thinking_header_printed = True
+
+        if self.thinking_mode != "full":
+            return
+
+        # Stream full reasoning lines permanently into terminal scrollback
+        if is_first and not self._thinking_header_printed:
+            self._emit(Text("[Thinking]", style="dim bold"))
+            self._thinking_header_printed = True
 
         self._thinking_buf += token
         while "\n" in self._thinking_buf:
@@ -99,15 +115,12 @@ class StreamRenderer:
 
     def add_answer(self, token: str) -> None:
         self._finalize_thinking(use_live=True)
-
         self._answer_buf += token
-        if not self._answer_started:
-            self._answer_buf = self._answer_buf.lstrip("\n")
-            if self._answer_buf:
-                with self._lock:
-                    self._answer_started = True
 
         with self._lock:
+            if not self._answer_started:
+                self._answer_buf = self._answer_buf.lstrip("\n")
+                self._answer_started = bool(self._answer_buf)
             self._answer_chars += len(token)
 
         self._flush_complete_blocks()
@@ -131,29 +144,19 @@ class StreamRenderer:
             return
 
         if self.thinking_mode == "collapse":
-            self._emit(
-                Text(
-                    f"  [Thought process collapsed ({chars:,} chars — /thinking full to keep expanded)]",
-                    style="dim italic",
-                ),
-                use_live=use_live,
-            )
-            self._emit(Text(""), use_live=use_live)
-        elif self.thinking_mode == "full":
-            if leftover.strip():
-                self._emit(Text(leftover, style="dim italic"), use_live=use_live)
-            self._emit(Text(""), use_live=use_live)
+            msg = f"  [Thought process collapsed ({chars:,} chars — /thinking full to keep expanded)]"
+            self._emit(Text(msg, style="dim italic"), use_live=use_live)
+        elif leftover.strip():
+            self._emit(Text(leftover, style="dim italic"), use_live=use_live)
+        self._emit(Text(""), use_live=use_live)
 
     def _flush_complete_blocks(self) -> None:
+        """Flushes completed Markdown paragraphs/code blocks while keeping open fences buffered."""
         lines = self._answer_buf.splitlines(keepends=True)
         if not lines:
             return
 
-        if lines[-1].endswith("\n"):
-            complete_lines, tail = lines, ""
-        else:
-            complete_lines, tail = lines[:-1], lines[-1]
-
+        complete_lines, tail = (lines, "") if lines[-1].endswith("\n") else (lines[:-1], lines[-1])
         in_fence = False
         last_cut = 0
         has_content = False
@@ -175,53 +178,40 @@ class StreamRenderer:
                 self._emit(Markdown(chunk, code_theme="monokai"))
             self._answer_buf = "".join(complete_lines[last_cut:]) + tail
 
-    def _flush_answer_tail(self, use_live: bool = False) -> None:
-        if self._answer_buf.strip():
-            self._emit(Markdown(self._answer_buf, code_theme="monokai"), use_live=use_live)
-        self._answer_buf = ""
-
     def __rich__(self):
         with self._lock:
-            status_note = self._status_note
-            thinking_chars = self._thinking_chars
-            answer_chars = self._answer_chars
-            answer_started = self._answer_started
-            show_live_thinking = (
-                self.thinking_mode == "collapse"
-                and not self._thinking_finalized
-                and bool(self._thinking_buf)
+            note = self._status_note
+            t_chars, a_chars, a_started = self._thinking_chars, self._answer_chars, self._answer_started
+            live_thinking = (
+                self._thinking_buf
+                if self.thinking_mode == "collapse" and not self._thinking_finalized and self._thinking_buf
+                else ""
             )
-            thinking_text = self._thinking_buf if show_live_thinking else ""
 
-        if status_note:
-            label = Text(status_note, style="dim cyan")
-        elif answer_started:
-            label = Text(f"Streaming response... ({answer_chars:,} chars)", style="dim")
-        elif thinking_chars > 0:
-            label = Text(f"Thinking... ({thinking_chars:,} chars)", style="dim")
+        if note:
+            label = Text(note, style="dim cyan")
+        elif a_started:
+            label = Text(f"Streaming response... ({a_chars:,} chars)", style="dim")
+        elif t_chars > 0:
+            label = Text(f"Thinking... ({t_chars:,} chars)", style="dim")
         else:
             label = Text("Thinking...", style="dim")
 
         status_row = Columns([self._spinner, label], padding=(0, 1))
-        if not thinking_text:
+        if not live_thinking:
             return status_row
 
-        inner_width = max(20, console.size.width - 6)
-        max_visible_rows = max(4, console.size.height - 6)
-        char_budget = max_visible_rows * inner_width + 500
-        snippet = thinking_text[-char_budget:] if len(thinking_text) > char_budget else thinking_text
-        wrapped = Text(snippet.replace("\r", ""), style="dim italic").wrap(console, inner_width)
-
-        if len(wrapped) > max_visible_rows:
-            visible = wrapped[-max_visible_rows:]
-            title = f"[dim]Thinking ({thinking_chars:,} chars — live tail)[/dim]"
-        else:
-            visible = wrapped
-            title = f"[dim]Thinking ({thinking_chars:,} chars)[/dim]"
+        # Render a bounded tail window of active reasoning inside the transient Live area
+        width = max(20, console.size.width - 6)
+        max_rows = max(4, console.size.height - 6)
+        snippet = live_thinking[-(max_rows * width + 500) :]
+        wrapped = Text(snippet.replace("\r", ""), style="dim italic").wrap(console, width)
+        visible = wrapped[-max_rows:]
+        title_suffix = " — live tail" if len(wrapped) > max_rows else ""
 
         panel = Panel(
             Text("\n").join(visible),
-            title=title,
+            title=f"[dim]Thinking ({t_chars:,} chars{title_suffix})[/dim]",
             title_align="left",
             box=box.HORIZONTALS,
             border_style="dim",
@@ -236,7 +226,7 @@ def print_help() -> None:
     table.add_column("Command", style="bold green")
     table.add_column("Description")
 
-    commands = [
+    for cmd, desc in (
         ("/pane [off]", "Open right-side query viewer pane (or '/pane off' to close it)"),
         ("/show [n]", "Show the result table for query #n (defaults to latest)"),
         ("/sql <query>", "Execute a read-only DuckDB SQL query directly"),
@@ -248,33 +238,40 @@ def print_help() -> None:
         ("/clear", "Clear conversation history and cached query results"),
         ("/help", "Show this command reference"),
         ("exit", "Exit the investigation CLI"),
-    ]
-    for cmd, desc in commands:
+    ):
         table.add_row(cmd, desc)
-
     console.print(table)
 
 
 def print_result_table(entry: dict, max_rows: int = 50) -> None:
     """Renders a cached query result entry as a Rich Table."""
-    rows = entry.get("rows") or []
-    columns = entry.get("columns") or []
-    truncated = bool(entry.get("truncated", False))
-    qid = entry.get("id")
-
+    rows, columns = entry.get("rows") or [], entry.get("columns") or []
     if not rows:
         console.print("[dim][-] Query returned 0 rows.[/dim]")
         return
 
-    prefix = f"Query #{qid} — " if qid else ""
+    truncated = bool(entry.get("truncated", False))
+    prefix = f"Query #{entry['id']} — " if entry.get("id") else ""
     table = Table(title=f"{prefix}{len(rows)}{'+' if truncated else ''} rows")
     for col in columns:
         table.add_column(str(col), overflow="fold")
     for row in rows:
         table.add_row(*("" if val is None else str(val) for val in row))
+
     console.print(table)
     if truncated:
         console.print(f"[yellow][*] Output capped at {max_rows} rows.[/yellow]")
+
+
+def _parse_choice(raw: str, choices: dict[str, str]) -> tuple[str, str]:
+    """Splits input like 'n: try approach XYZ' into ('n', 'try approach XYZ')."""
+    stripped = raw.strip()
+    if not stripped:
+        return "", ""
+    parts = stripped.split(None, 1)
+    token = parts[0].lower().rstrip(":,;-")
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    return (token, rest) if token in choices else (stripped.lower(), "")
 
 
 def _prompt_panel_choice(
@@ -282,44 +279,54 @@ def _prompt_panel_choice(
     body,
     border_style: str,
     prompt_text: str,
-    choices: dict[str, _T],
-    default_decline: _T,
+    choices: dict[str, str],
+    default_decline: str,
     decline_msg: str,
     invalid_msg: str,
     note: str | None = None,
-) -> _T:
-    """Shared HITL confirmation panel and input loop."""
+) -> ConfirmDecision:
+    """Shared HITL confirmation panel supporting inline ('n <reason>') or prompted decline feedback."""
     console.print()
     console.print(
-        Panel(
-            body,
-            title=title,
-            title_align="left",
-            box=box.HORIZONTALS,
-            border_style=border_style,
-            padding=(0, 1),
-        )
+        Panel(body, title=title, title_align="left", box=box.HORIZONTALS, border_style=border_style, padding=(0, 1))
     )
     if note:
         console.print(note)
 
     while True:
         try:
-            raw = input(prompt_text).strip().lower()
+            raw = input(prompt_text)
         except (KeyboardInterrupt, EOFError):
             console.print(decline_msg)
-            return default_decline
+            return ConfirmDecision(approved=False, choice=default_decline)
 
-        if raw in choices:
-            result = choices[raw]
-            if result == default_decline:
-                console.print(decline_msg)
-            return result
-        console.print(invalid_msg)
+        token, inline_feedback = _parse_choice(raw, choices)
+        if token not in choices:
+            console.print(invalid_msg)
+            continue
+
+        choice = choices[token]
+        is_decline = choice == default_decline
+
+        # Reject trailing text on approvals so typos never silently approve
+        if inline_feedback and not is_decline:
+            console.print(invalid_msg)
+            continue
+
+        if is_decline:
+            try:
+                feedback = inline_feedback or input("Feedback for AI (Enter to skip): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                feedback = ""
+            suffix = " [dim](feedback sent to AI)[/dim]" if feedback else ""
+            console.print(f"{decline_msg}{suffix}")
+            return ConfirmDecision(approved=False, choice=choice, feedback=feedback)
+
+        return ConfirmDecision(approved=True, choice=choice)
 
 
-def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str:
-    """Displays a sleek, compact SQL proposal and returns 'yes', 'table', or 'no'."""
+def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> ConfirmDecision:
+    """Displays a compact SQL proposal and returns a ConfirmDecision ('yes', 'table', or 'no')."""
     content = Group(
         Text.assemble(("Rationale: ", "bold yellow"), (reason or "No reason given", "italic")),
         Text(""),
@@ -334,31 +341,34 @@ def confirm_sql(reason: str, sql: str, has_inner_semicolon: bool = False) -> str
         title="[bold cyan]Proposed SQL[/bold cyan]",
         body=content,
         border_style="cyan",
-        prompt_text="Execute? [Y]es / [t]able / [n]o: ",
+        prompt_text="Execute? [Y]es / [t]able / [n]o (or 'n <reason>'): ",
         choices={"": "yes", "y": "yes", "yes": "yes", "t": "table", "table": "table", "n": "no", "no": "no"},
         default_decline="no",
         decline_msg="[yellow][-] Query declined.[/yellow]",
-        invalid_msg="[red][!] Enter y (quiet), t (show table), or n (decline).[/red]",
+        invalid_msg="[red][!] Enter y (quiet), t (show table), or n [reason] (decline).[/red]",
         note=note,
     )
 
 
-def confirm_action(title: str, details: list[str], prompt: str = "Proceed? [Y]es / [n]o: ") -> bool:
-    """Generic HITL approval prompt for side-effect tools like launching GUI viewers."""
-    body = Group(*(Text(f"• {line}") for line in details))
+def confirm_action(
+    title: str,
+    details: list[str],
+    prompt: str = "Proceed? [Y]es / [n]o (or 'n <reason>'): ",
+) -> ConfirmDecision:
+    """Generic HITL approval prompt for file reads, hex dumps, or GUI viewers."""
     return _prompt_panel_choice(
         title=f"[bold cyan]{title}[/bold cyan]",
-        body=body,
+        body=Group(*(Text(f"• {line}") for line in details)),
         border_style="cyan",
         prompt_text=prompt,
-        choices={"": True, "y": True, "yes": True, "n": False, "no": False},
-        default_decline=False,
+        choices={"": "yes", "y": "yes", "yes": "yes", "n": "no", "no": "no"},
+        default_decline="no",
         decline_msg="[yellow][-] Action declined.[/yellow]",
-        invalid_msg="[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]",
+        invalid_msg="[red][!] Invalid choice. Press Enter for Yes, or enter n [reason].[/red]",
     )
 
 
-def confirm_terminal(reason: str, command: str, cwd: str) -> bool:
+def confirm_terminal(reason: str, command: str, cwd: str) -> ConfirmDecision:
     """High-visibility HITL prompt for last-resort shell commands. Defaults to NO on Enter."""
     lexer = "powershell" if os.name == "nt" else "bash"
     content = Group(
@@ -368,12 +378,12 @@ def confirm_terminal(reason: str, command: str, cwd: str) -> bool:
         Syntax(command.strip(), lexer, theme="monokai", word_wrap=True),
     )
     return _prompt_panel_choice(
-        title="[bold red]Proposed Terminal Command (Last Resort)[/bold red]",
+        title="[bold red]Proposed Terminal Command[/bold red]",
         body=content,
         border_style="red",
-        prompt_text="Execute shell command? [y]es / [N]o: ",
-        choices={"y": True, "yes": True, "": False, "n": False, "no": False},
-        default_decline=False,
+        prompt_text="Execute shell command? [y]es / [N]o (or 'n <reason>'): ",
+        choices={"y": "yes", "yes": "yes", "": "no", "n": "no", "no": "no"},
+        default_decline="no",
         decline_msg="[yellow][-] Terminal command declined.[/yellow]",
-        invalid_msg="[red][!] Enter y to execute, or press Enter / n to decline.[/red]",
+        invalid_msg="[red][!] Enter y to execute, or press Enter / n [reason] to decline.[/red]",
     )

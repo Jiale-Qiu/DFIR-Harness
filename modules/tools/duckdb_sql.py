@@ -7,93 +7,68 @@ import re
 
 import duckdb
 
-from modules.llm_ui import confirm_sql, console, print_result_table
+from modules.llm_ui import confirm_sql, console, declined_payload, print_result_table
 
 MAX_SQL_ROWS = 50
 MAX_LLM_CELL_CHARS = 500
 MAX_LLM_PAYLOAD_CHARS = 24_000
 
-_ALLOWED_START = re.compile(
-    r"^\s*(SELECT|WITH|DESCRIBE|SHOW|SUMMARIZE|EXPLAIN)\b",
-    re.IGNORECASE,
-)
+_ALLOWED_START = re.compile(r"^\s*(SELECT|WITH|DESCRIBE|SHOW|SUMMARIZE|EXPLAIN)\b", re.IGNORECASE)
 
 _FORBIDDEN_KEYWORDS = re.compile(
-    r"\b("
-    r"INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE|MERGE|"
+    r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE|MERGE|"
     r"COPY|ATTACH|DETACH|PRAGMA|INSTALL|LOAD|SET|RESET|CALL|"
-    r"EXPORT|IMPORT|CHECKPOINT|VACUUM|EXECUTE|PREPARE"
-    r")\b",
+    r"EXPORT|IMPORT|CHECKPOINT|VACUUM|EXECUTE|PREPARE)\b",
     re.IGNORECASE,
 )
 
-# Blocks local filesystem reads, env var access, secrets, and network functions inside SELECT
+# Blocks direct disk I/O, env/secret inspection, and network functions inside SELECT
 _FORBIDDEN_FUNCTIONS = re.compile(
-    r"\b("
-    r"read_csv|read_csv_auto|read_parquet|read_json|read_json_auto|read_ndjson|"
+    r"\b(read_csv|read_csv_auto|read_parquet|read_json|read_json_auto|read_ndjson|"
     r"read_text|read_blob|read_xlsx|parquet_scan|csv_scan|json_scan|sqlite_scan|"
     r"postgres_scan|mysql_scan|iceberg_scan|delta_scan|glob|getenv|current_setting|"
-    r"duckdb_settings|duckdb_secrets|duckdb_extensions|http_get|http_post|shellfs"
-    r")\s*\(",
+    r"duckdb_settings|duckdb_secrets|duckdb_extensions|http_get|http_post|shellfs)\s*\(",
     re.IGNORECASE,
 )
-
-
-def _strip_sql_comments_and_strings(sql: str) -> str:
-    """Removes SQL comments and single-quoted string literals for safe static inspection."""
-    no_block = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    no_line = re.sub(r"--[^\n]*", " ", no_block)
-    return re.sub(r"'(?:''|[^'])*'", "''", no_line)
 
 
 def validate_readonly_sql(sql: str) -> tuple[bool, str | None]:
     """Validates that a query is a single read-only statement without external/system functions."""
-    cleaned = _strip_sql_comments_and_strings(sql or "").strip()
+    # Strip SQL comments and single-quoted string literals before static keyword inspection
+    no_comments = re.sub(r"--[^\n]*", " ", re.sub(r"/\*.*?\*/", " ", sql or "", flags=re.DOTALL))
+    cleaned = re.sub(r"'(?:''|[^'])*'", "''", no_comments).strip()
+
     if not cleaned:
         return False, "Empty SQL query."
-
     if ";" in cleaned.rstrip(";"):
         return False, "Multiple SQL statements are not permitted. Submit one read-only query at a time."
-
     if not _ALLOWED_START.match(cleaned):
         return False, "Only read-only SELECT/WITH/DESCRIBE/SHOW/SUMMARIZE/EXPLAIN queries are permitted."
-
     if kw := _FORBIDDEN_KEYWORDS.search(cleaned):
         return False, f"Blocked forbidden SQL keyword: {kw.group(1).upper()}"
-
     if fn := _FORBIDDEN_FUNCTIONS.search(cleaned):
         return False, f"Blocked external/system DuckDB function: {fn.group(1)}()"
-
     return True, None
 
 
-def _stringify(val: object) -> str:
-    return "" if val is None else str(val)
-
-
 def _trim_for_llm(columns: list[str], rows: list[list[str]]) -> tuple[list[dict[str, str]], bool]:
-    """Builds a context-bounded list of row dicts for the LLM without altering full viewer history."""
+    """Builds a context-bounded list of non-empty row dicts without altering full viewer history."""
     llm_rows: list[dict[str, str]] = []
     char_budget = 0
-    clipped = False
 
     for row in rows:
-        record: dict[str, str] = {}
-        for col, val in zip(columns, row):
-            if not val:
-                continue
-            if len(val) > MAX_LLM_CELL_CHARS:
-                val = val[: MAX_LLM_CELL_CHARS - 1] + "…"
-            record[col] = val
-
-        serialized_len = len(json.dumps(record, ensure_ascii=False))
-        if char_budget + serialized_len > MAX_LLM_PAYLOAD_CHARS and llm_rows:
-            clipped = True
-            break
+        record = {
+            col: (val[: MAX_LLM_CELL_CHARS - 1] + "…" if len(val) > MAX_LLM_CELL_CHARS else val)
+            for col, val in zip(columns, row)
+            if val
+        }
+        size = len(json.dumps(record, ensure_ascii=False))
+        if char_budget + size > MAX_LLM_PAYLOAD_CHARS and llm_rows:
+            return llm_rows, True
         llm_rows.append(record)
-        char_budget += serialized_len
+        char_budget += size
 
-    return llm_rows, clipped
+    return llm_rows, False
 
 
 def execute_sql(
@@ -103,7 +78,7 @@ def execute_sql(
     show_table: bool = False,
     max_rows: int = MAX_SQL_ROWS,
 ) -> dict:
-    """Validates and executes a read-only DuckDB query, caching results in session history."""
+    """Validates and executes a read-only DuckDB query, caching full results in session history."""
     is_safe, err = validate_readonly_sql(sql)
     if not is_safe:
         console.print(f"[red][!] SQL Rejected: {err}[/red]")
@@ -120,18 +95,9 @@ def execute_sql(
         return {"error": f"DuckDB error: {exc}"}
 
     truncated = len(raw_rows) > row_limit
-    if truncated:
-        raw_rows = raw_rows[:row_limit]
-
-    rows = [[_stringify(cell) for cell in row] for row in raw_rows]
+    rows = [["" if cell is None else str(cell) for cell in row] for row in raw_rows[:row_limit]]
     qid = len(history) + 1
-    entry = {
-        "id": qid,
-        "sql": clean_sql,
-        "columns": columns,
-        "rows": rows,
-        "truncated": truncated,
-    }
+    entry = {"id": qid, "sql": clean_sql, "columns": columns, "rows": rows, "truncated": truncated}
     history.append(entry)
 
     if show_table:
@@ -167,16 +133,14 @@ def _query_duckdb(args: dict, ctx: dict) -> dict:
 
     state = ctx["state"]
     if state.get("auto_sql"):
-        short_sql = " ".join(sql.split())
-        if len(short_sql) > 140:
-            short_sql = short_sql[:139] + "…"
-        console.print(f"[dim cyan][auto-sql] {short_sql}[/dim cyan]")
+        preview = " ".join(sql.split())
+        console.print(f"[dim cyan][auto-sql] {preview[:139] + '…' if len(preview) > 140 else preview}[/dim cyan]")
         show_table = False
     else:
         decision = confirm_sql(reason, sql)
-        if decision == "no":
-            return {"status": "declined", "message": "Analyst declined SQL execution."}
-        show_table = decision == "table"
+        if not decision:
+            return declined_payload("Analyst declined SQL execution.", decision.feedback)
+        show_table = decision.choice == "table"
 
     return execute_sql(ctx["con"], sql, state["history"], show_table=show_table)
 
