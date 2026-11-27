@@ -185,7 +185,13 @@ def _build_system_prompt(
         "the tool result, pivot immediately to follow that guidance instead of repeating the declined call.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
-        "to synthesize findings rather than issuing another query."
+        "to synthesize findings rather than issuing another query.\n"
+        "9. Clean up after yourself (`run_terminal`): any scratch file, script, extracted archive, or temp "
+        "output that YOU create must be deleted once it is no longer needed — at the latest before you finish "
+        "the task (e.g., `Remove-Item -Recurse -Force .\\scratch_name`). Prefer extracting or writing "
+        "throwaway files under `$env:TEMP` rather than inside the case folders. NEVER delete, move, or "
+        "overwrite collected evidence, parsed CSVs, or anything you did not create; if cleanup would touch an "
+        "ambiguous path, ask the analyst first."
     )
 
 

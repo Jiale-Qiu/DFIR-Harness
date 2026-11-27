@@ -164,7 +164,9 @@ REGISTER = [
                     "Use query_duckdb for mounted CSV views and read_file for simple text/hex slices, "
                     "but use run_terminal whenever CLI utilities are better suited—such as hashing files, "
                     "running strings/regex searches across artifacts, inspecting SQLite DBs/archives/PE headers, "
-                    "or parsing unmounted evidence. Keep commands read-only and output-bounded."
+                    "or parsing unmounted evidence. Keep commands read-only and output-bounded. If a command "
+                    "must create scratch files or extract archives, do it under $env:TEMP and delete everything "
+                    "you created before finishing."
                 ),
                 "parameters": {
                     "type": "object",
