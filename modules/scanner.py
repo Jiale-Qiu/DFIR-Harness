@@ -28,10 +28,23 @@ def _match_header(header: bytes) -> str | None:
             return category
     return None
 
+def _match_filename(item: Path) -> str | None:
+    name = item.name.lower()
+    if name.endswith(".csv"):
+        return None
+    if name == "$j" or name.endswith(("_$j", "-$j")) or ("usnjrnl" in name and "$max" not in name):
+        return "usnjrnl"
+    return None
 
 def scanDirectory(directory: Path | str) -> dict[str, list[Path]]:
     target_path = Path(directory)
-    files: dict[str, list[Path]] = {"evtx": [], "registry": [], "prefetch": [], "mft": []}
+    files: dict[str, list[Path]] = {
+        "evtx": [],
+        "registry": [],
+        "prefetch": [],
+        "mft": [],
+        "usnjrnl": [],
+    }
 
     if not target_path.is_dir():
         return files
@@ -40,13 +53,12 @@ def scanDirectory(directory: Path | str) -> dict[str, list[Path]]:
         try:
             if not item.is_file():
                 continue
-            # Read the header once per file rather than reopening for each signature
             with item.open("rb") as f:
                 header = f.read(_HEADER_READ_SIZE)
         except OSError:
             continue
 
-        category = _match_header(header)
+        category = _match_header(header) or _match_filename(item)
         if category:
             files[category].append(item)
 

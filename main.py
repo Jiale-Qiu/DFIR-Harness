@@ -15,6 +15,7 @@ PARSERS = {
     "registry": registryParser.parse,
     "prefetch": prefetchParser.parse,
     "mft": mftParser.parse,
+    "usnjrnl": mftParser.parse_usnjrnl,
 }
 
 
@@ -120,7 +121,15 @@ def main() -> None:
                     parse_all = True
 
             console.print(f"[cyan][*] Running {category.upper()} parser...[/cyan]")
-            PARSERS[category](file_list, base_output / category, dry_run=args.dry_run)
+            if category == "usnjrnl":
+                mftParser.parse_usnjrnl(
+                    file_list,
+                    base_output / category,
+                    mft_files=files.get("mft"),
+                    dry_run=args.dry_run,
+                )
+            else:
+                PARSERS[category](file_list, base_output / category, dry_run=args.dry_run)
 
     if not args.dry_run:
         triage.run_triage(base_output, main_directory=main_directory)

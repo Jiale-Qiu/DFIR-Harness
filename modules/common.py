@@ -8,6 +8,7 @@ ARTIFACT_SOURCES: dict[str, tuple[str, str]] = {
     "prefetch_timeline": ("prefetch", "*_PECmd_Output_Timeline.csv"),
     "registry": ("registry", "*.csv"),
     "mft": ("mft", "*.csv"),
+    "usnjrnl": ("usnjrnl", "*.csv"),
 }
 
 

@@ -4,7 +4,7 @@ import duckdb
 from rich.console import Console
 from rich.table import Table
 
-from modules import hunts, llm_cli
+from modules import llm_cli
 from modules.common import ARTIFACT_SOURCES
 
 console = Console(highlight=False)
@@ -70,21 +70,5 @@ def run_triage(base_output: Path, main_directory: Path | None = None) -> None:
         if not mounted_views:
             console.print("[yellow][!] No valid CSVs found to mount in DuckDB.[/yellow]")
             return
-
-        console.print("\nRun initial triage (default baseline queries for available artifacts)?")
-        while True:
-            try:
-                choice = input("Continue? [Y]es / [n]o: ").strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow][-] Skipping initial triage queries.[/yellow]")
-                break
-
-            if choice in ("", "y", "yes"):
-                hunts.run_all(con, mounted_views, base_output)
-                break
-            if choice in ("n", "no"):
-                console.print("[yellow][-] Skipping initial triage queries.[/yellow]")
-                break
-            console.print("[red][!] Invalid choice. Press Enter for Yes, or enter n.[/red]")
 
         llm_cli.start_cli(con, mounted_views, base_output, main_directory=main_directory)

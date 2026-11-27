@@ -25,9 +25,8 @@ VALID_LEVELS = ("low", "medium", "high", "off")
 VALID_THINKING_MODES = ("collapse", "full", "off")
 DEFAULT_REASONING = "medium"
 DEFAULT_THINKING_MODE = "collapse"
-MAX_TOOL_ROUNDS = 6
-MAX_TRIAGE_CHARS = 6000
-MAX_TOKENS = 8192
+MAX_TOOL_ROUNDS = 10
+MAX_TOKENS = 16384
 
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
@@ -113,18 +112,6 @@ def _build_system_prompt(
                 f"{source_tree}\n```\n\n"
             )
 
-    triage_block = ""
-    summary_path = base_output / "triage_summary.json"
-    if summary_path.is_file():
-        try:
-            raw = summary_path.read_text(encoding="utf-8").strip()
-            if raw and raw != "{}":
-                if len(raw) > MAX_TRIAGE_CHARS:
-                    raw = raw[:MAX_TRIAGE_CHARS] + "\n... (truncated)"
-                triage_block = f"\n\n### Initial Triage Summary (already executed)\n```json\n{raw}\n```"
-        except OSError:
-            pass
-
     return (
         "You are an expert Windows DFIR analyst assisting a human investigator.\n"
         "Use your registered tools to query DuckDB artifacts, inspect case files, decode obfuscated payloads, "
@@ -157,7 +144,6 @@ def _build_system_prompt(
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
         "to synthesize findings rather than issuing another query."
-        + triage_block
     )
 
 
