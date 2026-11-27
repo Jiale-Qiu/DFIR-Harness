@@ -12,7 +12,14 @@ from rich.table import Table
 from modules.tools.terminal import get_terminal_env_summary
 
 from modules.common import format_bytes
-from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
+from modules.llm_ui import (
+    ConfirmDecision,
+    StreamRenderer,
+    confirm_checkpoint,
+    console,
+    print_help,
+    print_result_table,
+)
 from modules.pane_bridge import (
     clear_result_pane,
     close_result_pane,
@@ -29,8 +36,17 @@ VALID_LEVELS = ("low", "medium", "high", "off")
 VALID_THINKING_MODES = ("collapse", "full", "off")
 DEFAULT_REASONING = "medium"
 DEFAULT_THINKING_MODE = "collapse"
+DEFAULT_CHECKIN_ROUNDS = 3
 MAX_TOOL_ROUNDS = 10
 MAX_TOKENS = 16384
+
+_STATUS_REQUEST = (
+    "Check in with the analyst now. Do not call tools.\n"
+    "Reply in at most 6 short lines, using exactly these labels:\n"
+    "Findings: what you have established so far, with the evidence behind each point.\n"
+    "Next step: the single next action you plan to take, and why.\n"
+    "Uncertain: anything still unverified or speculative."
+)
 
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
@@ -191,7 +207,12 @@ def _build_system_prompt(
         "the task (e.g., `Remove-Item -Recurse -Force .\\scratch_name`). Prefer extracting or writing "
         "throwaway files under `$env:TEMP` rather than inside the case folders. NEVER delete, move, or "
         "overwrite collected evidence, parsed CSVs, or anything you did not create; if cleanup would touch an "
-        "ambiguous path, ask the analyst first."
+        "ambiguous path, ask the analyst first.\n"
+        f"10. Analyst check-ins: the harness may pause you every few tool rounds to show your findings and "
+        "plan to the analyst. Keep each step small and independently verifiable, state ONE next action at a "
+        "time, and never assume approval. If the analyst redirects you, drop the previous approach and follow "
+        "their direction. Do not attempt to answer the whole question in one turn when evidence is still "
+        "incomplete — report what is verified, flag what is not, and stop."
     )
 
 
@@ -407,6 +428,23 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         _set_enum_option(state, "thinking_mode", "Thinking display", arg, VALID_THINKING_MODES)
         return True
 
+    if cmd_lower == "/checkin":
+        arg_lower = arg.lower()
+        if arg_lower in ("", "on"):
+            state["checkin_every"] = DEFAULT_CHECKIN_ROUNDS
+        elif arg_lower in ("off", "0"):
+            state["checkin_every"] = 0
+        elif arg_lower.isdigit():
+            state["checkin_every"] = max(1, min(MAX_TOOL_ROUNDS - 1, int(arg_lower)))
+        else:
+            console.print("[yellow][!] Usage: /checkin <rounds|on|off>[/yellow]\n")
+            return True
+
+        every = state["checkin_every"]
+        status = f"every {every} tool round(s)" if every else "disabled"
+        console.print(f"[cyan][*] Analyst check-ins: {status}.[/cyan]\n")
+        return True
+
     if cmd_lower == "/show":
         history = state["history"]
         if not history:
@@ -484,6 +522,49 @@ def _build_retry_messages(messages: list[dict], last_reasoning: str) -> list[dic
     return [*messages, {"role": "user", "content": nudge}]
 
 
+def _should_check_in(state: dict, round_idx: int) -> bool:
+    every = state.get("checkin_every", 0)
+    return every > 0 and round_idx > 0 and round_idx % every == 0
+
+
+def _check_in(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    state: dict,
+    round_idx: int,
+) -> ConfirmDecision:
+    """Pauses the turn so the analyst can approve the model's plan or redirect it."""
+    base_len = len(messages)
+    messages.append({"role": "user", "content": _STATUS_REQUEST})
+    status = ""
+    try:
+        status, _reasoning, _tool_calls, _finish = _stream_completion(
+            client, model, messages, state, allow_tools=False
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow][-] Status request interrupted.[/yellow]\n")
+    finally:
+        del messages[base_len:]
+
+    if not status.strip():
+        status = "Findings: (no summary produced)\nNext step: continuing the previous approach."
+
+    decision = confirm_checkpoint(status, round_idx)
+    if decision.approved:
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Analyst approved your plan. Continue.\n<status>\n{status}\n</status>",
+            }
+        )
+    elif decision.feedback:
+        messages.append(
+            {"role": "user", "content": f"<analyst_redirect>\n{decision.feedback}\n</analyst_redirect>"}
+        )
+    return decision
+
+
 def _run_agent_turn(client: OpenAI, model: str, messages: list[dict], ctx: dict, turn_start_idx: int) -> None:
     """Executes up to MAX_TOOL_ROUNDS of LLM calls and tool dispatches for one user prompt."""
     state = ctx["state"]
@@ -558,6 +639,17 @@ def _run_agent_turn(client: OpenAI, model: str, messages: list[dict], ctx: dict,
             )
         round_idx += 1
 
+        if _should_check_in(state, round_idx) and round_idx < MAX_TOOL_ROUNDS:
+            decision = _check_in(client, model, messages, state, round_idx)
+            if decision.approved:
+                continue
+            if decision.feedback:
+                round_idx = 0
+                console.print("[cyan][*] Analyst redirected the investigation.[/cyan]\n")
+            else:
+                console.print("[yellow][-] Analyst stopped the investigation at the check-in.[/yellow]\n")
+                return
+
     console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
 
 
@@ -589,6 +681,7 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
             "reasoning": DEFAULT_REASONING,
             "thinking_mode": DEFAULT_THINKING_MODE,
             "auto_sql": False,
+            "checkin_every": DEFAULT_CHECKIN_ROUNDS,
             "history": [],
             "pane_path": pane_path,
         },

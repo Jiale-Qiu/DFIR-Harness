@@ -38,6 +38,22 @@ directly (`& "C:\Program Files\7-Zip\7z.exe" l archive.7z`). Every installed pip
 listed too, auto-detected via `importlib.metadata`, so packages added with a normal
 `pip install` outside the harness are picked up automatically.
 
+Analyst Check-ins
+-----------------
+The agent pauses every few tool rounds to report what it has established and the single
+next step it plans to take, then waits for you (default: every 3 rounds):
+
+```
+Findings: target.exe has an alternate data stream + a suspicious Run key value
+Next step: dump and hash the ADS payload, then check Autoruns for persistence
+
+Continue? [Y]es / [n]o (or 'n <redirection>'): _
+```
+
+Enter/y continues; `n <direction>` (or `n` plus the feedback prompt) redirects the model
+instead, and a bare `n` stops the turn. Adjust the cadence in-session with
+`/checkin <rounds|on|off>` — `off` gives the model its full 10-round budget uninterrupted.
+
 Template Tool:
 ```python
 def _my_handler(args: dict, ctx: dict) -> dict:

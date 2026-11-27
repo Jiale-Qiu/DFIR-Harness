@@ -231,11 +231,12 @@ def print_help() -> None:
         ("/show [n]", "Show the result table for query #n (defaults to latest)"),
         ("/sql <query>", "Execute a read-only DuckDB SQL query directly"),
         ("/autosql [on|off]", "Toggle auto-accept for validated read-only SQL (default: off)"),
+        ("/checkin <n|on|off>", "Pause every n tool rounds to approve or redirect the model's plan"),
         ("/schema", "List mounted DuckDB views, row counts, and columns"),
         ("/tools [list]", "List registered tool directories/files, pip packages, and AI tools"),
         ("/tools add <dir|file>", "Register a directory (added to PATH) or a single tool file (by path)"),
         ("/tools remove <dir|file|#>", "Unregister a tool directory or file by path or number"),
-        ("/tools pip install <pkgs>", "pip install packages for this interpreter and record them"),
+        ("/tools pip install <pkgs>", "pip install packages for this interpreter (auto-detected)"),
         ("/reasoning <level>", "Set reasoning effort: low, medium, high, or off"),
         ("/thinking <mode>", "Set thinking display: collapse (live->collapse), full, or off"),
         ("/clear", "Clear conversation history and cached query results"),
@@ -368,6 +369,21 @@ def confirm_action(
         default_decline="no",
         decline_msg="[yellow][-] Action declined.[/yellow]",
         invalid_msg="[red][!] Invalid choice. Press Enter for Yes, or enter n [reason].[/red]",
+    )
+
+
+def confirm_checkpoint(status: str, round_no: int) -> ConfirmDecision:
+    """HITL check-in: shows the model's findings + next step, then approves or redirects it."""
+    body = Markdown(status) if status.strip() else Text("[dim]Model returned no summary.[/dim]")
+    return _prompt_panel_choice(
+        title=f"[bold blue]Analyst Check-in (round {round_no})[/bold blue]",
+        body=body,
+        border_style="blue",
+        prompt_text="Continue? [Y]es / [n]o (or 'n <redirection>'): ",
+        choices={"": "yes", "y": "yes", "yes": "yes", "n": "no", "no": "no"},
+        default_decline="no",
+        decline_msg="[yellow][-] Check-in declined — the model will follow your direction.[/yellow]",
+        invalid_msg="[red][!] Press Enter to continue, or n [direction] to redirect.[/red]",
     )
 
 

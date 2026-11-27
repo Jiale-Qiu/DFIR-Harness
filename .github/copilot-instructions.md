@@ -21,8 +21,11 @@ Pipeline (see `main.py`):
    `modules/common.py` defines folder + filename pattern) and hands control to the CLI.
 5. `modules/llm_cli.py` — REPL: system prompt grounded in live view schemas, directory
    tree and host shell context; streams OpenAI-compatible completions; runs up to
-   `MAX_TOOL_ROUNDS` tool calls per turn; handles `/help`, `/pane`, `/autosql`, reasoning
-   level and thinking-mode slash commands.
+   `MAX_TOOL_ROUNDS` tool calls per turn; handles `/help`, `/pane`, `/autosql`, `/checkin`,
+   reasoning level and thinking-mode slash commands. `_check_in` is a loop-level gate:
+   every `state["checkin_every"]` tool rounds the model is asked for a Findings/Next
+   step/Uncertain summary (`_STATUS_REQUEST`, tools disabled), which the analyst approves
+   or redirects. Redirects reset the round budget; declines without feedback end the turn.
 6. `modules/llm_ui.py` — Rich rendering (streaming markdown/thinking), result tables, and
    the human-in-the-loop confirmation prompts (`confirm_sql`, `confirm_terminal`,
    `confirm_action`, `declined_payload`).
@@ -79,6 +82,7 @@ py -3 main.py --help
 #   /tools add C:\tools\hayabusa            (directory -> added to PATH)
 #   /tools add "C:\Program Files\7-Zip\7z.exe"   (single file -> absolute path only)
 #   /tools pip install yara-python
+#   /checkin 3                              (pause for analyst approval every 3 tool rounds)
 
 # Syntax/import smoke check (no tests exist)
 py -3 -m compileall -q main.py modules
@@ -110,6 +114,9 @@ against evidence to "test" a code change.
   read-only SQL validation in `modules/tools/duckdb_sql.py`, or the path confinement in
   `modules/tools/file_reader.py` / `_resolve_cwd` in `terminal.py`. New tools must keep
   the `REGISTER` schema/handler contract and return a dict.
+- **Keep the check-in gate deterministic.** `_check_in` in `modules/llm_cli.py` enforces
+  the analyst cadence from the agent loop; do not replace it with prompt-only instructions
+  or let a tool decline skip it. Model output is advisory, the loop decides.
 - **Handle failures defensively.** Subprocess/OS/DB failures are caught and surfaced with
   a short Rich message rather than raised to the top level, matching `run_ez_command` and
   `mount_views`. The same applies to `modules/toolbox.py`: a missing or corrupt config must
