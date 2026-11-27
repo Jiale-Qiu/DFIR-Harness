@@ -8,6 +8,8 @@ import duckdb
 from openai import OpenAI
 from rich.table import Table
 
+from modules.tools.terminal import get_terminal_env_summary
+
 from modules.common import format_bytes
 from modules.llm_ui import StreamRenderer, console, print_help, print_result_table
 from modules.pane_bridge import (
@@ -88,27 +90,48 @@ def _build_system_prompt(
     base_output: Path,
     main_directory: Path | None = None,
 ) -> str:
-    """Builds the DFIR system prompt grounded in live DuckDB schemas, file trees, and triage output."""
+    """Builds the DFIR system prompt grounded in live DuckDB schemas, host shell context, and file trees."""
     schema_lines = [
         f"- `{view}` ({info['rows']:,} rows): {', '.join(info['columns'])}"
         for view, info in schemas.items()
     ]
     base_resolved = base_output.resolve()
+    main_resolved = main_directory.resolve() if main_directory is not None else None
     output_tree = _build_directory_tree(base_resolved)
 
+    env_section = (
+        "### Host Shell, Working Directories & Path Mapping\n"
+        f"- **Environment:** {get_terminal_env_summary()}\n"
+        "- **Shell Syntax (CRITICAL):** On Windows, `run_terminal` executes directly in **PowerShell** "
+        "(NOT bash/sh/cmd). NEVER use Linux/bash commands (`ls`, `grep`, `cat`, `find`, `head`, `tail`, "
+        "`awk`, `sed`, `strings`, `xxd`, `sha256sum`, `2>/dev/null`). Use native PowerShell cmdlets "
+        "(`Get-ChildItem`, `Select-String`, `Get-Content`, `Get-FileHash`, `Format-Hex`).\n"
+        "- **Working Directories (`cwd`):**\n"
+        f'  - `root="output"` starts in: `{base_resolved}` (parsed CSVs)\n'
+        + (
+            f'  - `root="source"` starts in: `{main_resolved}` (raw collected artifacts)\n'
+            if main_resolved is not None
+            else ""
+        )
+        + "- **Victim Paths vs. Local Case Paths (CRITICAL):** Paths recorded inside MFT, USNJrnl, EVTX, "
+        "Prefetch, and Registry (e.g., `C:\\Users\\someone\\Desktop\\CVs`) are **victim system paths**, NOT "
+        "live paths on this analyst machine. Collected drive folders live inside `root=\"source\"` (e.g., "
+        "`C:\\Users\\someone\\Desktop\\CVs` maps to relative path `.\\C\\Users\\someone\\Desktop\\CVs` with "
+        "`root=\"source\"`). Never pass raw victim `C:\\...` paths to `run_terminal` or `read_file`.\n\n"
+    )
+
     source_section = ""
-    if main_directory is not None:
-        main_resolved = main_directory.resolve()
+    if main_resolved is not None:
         if main_resolved == base_resolved:
             source_section = (
-                f'### Source Investigation Directory (`root="source"`)\n'
+                '### Source Investigation Directory (`root="source"`)\n'
                 f"Same as the parsed output directory (`{main_resolved}`).\n\n"
             )
         elif main_resolved.is_dir():
             source_tree = _build_directory_tree(main_resolved)
             source_section = (
                 f'### Source Investigation Directory Tree (`root="source"`, {main_resolved})\n'
-                f"Raw/unparsed case artifacts in the selected investigation directory:\n```\n"
+                "Raw/unparsed case artifacts in the selected investigation directory:\n```\n"
                 f"{source_tree}\n```\n\n"
             )
 
@@ -119,6 +142,7 @@ def _build_system_prompt(
         "### Mounted DuckDB Views & Columns\n"
         + "\n".join(schema_lines)
         + "\n\n"
+        + env_section
         + source_section
         + f'### Parsed Output Directory Tree (`root="output"`, {base_resolved})\n```\n'
         + output_tree
@@ -129,18 +153,20 @@ def _build_system_prompt(
         "   - Use `ILIKE` for case-insensitive Windows path/filename matching.\n"
         "2. Always include `LIMIT 25` or `LIMIT 50` on non-aggregated queries (output caps at 50 rows).\n"
         "3. Use ONLY exact column names listed above. Never invent columns or views.\n"
-        "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd artifacts) when analyzing.\n"
+        "4. Filter out forensic collection noise (KAPE, RECmd, PECmd, EvtxECmd, MFTECmd artifacts) when analyzing.\n"
         "5. File Inspection (`read_file` / `list_directory`): Use `read_file` to inspect logs, scripts, JSON, "
-        'or unmounted text artifacts in either the source investigation directory (`root="source"`) or the '
-        'parsed output directory (`root="output"`). Prefer specifying `root` explicitly when a folder name '
-        "exists in both trees. For large files, ALWAYS use `search` or small `start_line`/`max_lines` "
-        "slices rather than trying to read whole files. Never use `read_file` on large CSVs that are already "
-        "mounted in DuckDB.\n"
+        'or unmounted artifacts in either `root="source"` or `root="output"`, passing `hex=True` '
+        "(with `offset`/`length`) for binary files. Prefer specifying `root` explicitly when a folder name "
+        "exists in both trees, and map victim `C:\\...` paths to relative paths under `root=\"source\"` "
+        "(e.g., `.\\C\\...`). For large text files, ALWAYS use `search` or small `start_line`/`max_lines` "
+        "slices rather than reading whole files. Never use `read_file` on large CSVs already mounted in DuckDB.\n"
         "6. Terminal Execution (`run_terminal`): Prefer `query_duckdb` for mounted views and `read_file` for "
         "simple text/hex slices, but use `run_terminal` when CLI tools are more effective (e.g., file hashing, "
-        "`strings`, multi-file regex search, SQLite/archive/PE inspection, or unparsed artifacts). Set `root` "
-        '(`"output"` or `"source"`) appropriately and keep commands read-only and output-bounded.\n'
-        "7. If the analyst declines a tool action, respect the decision and ask how they want to proceed.\n"
+        "`Select-String` multi-file search, SQLite/archive/PE inspection, or unparsed artifacts). Write valid "
+        'PowerShell syntax, set `root` (`"source"` or `"output"`) appropriately, use relative case paths, '
+        "and keep commands read-only and output-bounded.\n"
+        "7. If the analyst declines a tool action, respect the decision. If `analyst_feedback` is included in "
+        "the tool result, pivot immediately to follow that guidance instead of repeating the declined call.\n"
         f"8. You have a strict budget of {MAX_TOOL_ROUNDS} consecutive tool rounds per user prompt. "
         "Batch independent queries in parallel in a single turn when possible, and reserve your final round "
         "to synthesize findings rather than issuing another query."

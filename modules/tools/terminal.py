@@ -18,9 +18,10 @@ MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
 
 _PROBE_TOOLS = (
-    "pwsh", "powershell", "certutil", "findstr", "where",
-    "rg", "grep", "awk", "sed", "strings", "xxd", "hexdump",
-    "sha256sum", "shasum", "sqlite3", "7z", "tar", "file",
+    "pwsh", "powershell", "certutil", "findstr", "where", "tar", "wevtutil", "reg",
+    "rg", "7z", "sqlite3", "bstrings", "strings", "strings64", "sigcheck", "sigcheck64",
+    "MFTECmd", "EvtxECmd", "PECmd", "RECmd", "LECmd", "JLECmd",
+    "AmcacheParser", "AppCompatCacheParser", "WxTCmd", "SBECmd",
 )
 
 
@@ -35,19 +36,30 @@ def get_terminal_env_summary() -> str:
     ps_bin = _get_windows_ps()
 
     if os.name == "nt":
-        if ps_bin:
-            shell_info = f"PowerShell ({Path(ps_bin).name} -NoProfile -NonInteractive -Command)"
-        else:
-            shell_info = f"{Path(os.environ.get('COMSPEC', 'cmd.exe')).name} (PowerShell not found on PATH)"
+        shell_info = (
+            f"PowerShell ({Path(ps_bin).name})"
+            if ps_bin
+            else f"{Path(os.environ.get('COMSPEC', 'cmd.exe')).name} (PowerShell not found on PATH)"
+        )
     else:
-        shell_info = "/bin/sh (POSIX sh; use `bash -c` if bash-specific syntax is needed)"
+        shell_info = "/bin/sh (POSIX sh)"
 
     found = [tool for tool in _PROBE_TOOLS if shutil.which(tool)]
     found.append(f"python ({Path(sys.executable).name})")
     return f"OS: {os_label} | Shell: {shell_info} | Available CLI tools: {', '.join(found)}"
 
 
+_PS_BIN = _get_windows_ps()
 _ENV_SUMMARY = get_terminal_env_summary()
+
+# Put shell syntax rules right on the 'command' parameter so the LLM sees it while generating arguments
+_COMMAND_DESC = (
+    "Exact PowerShell command to run (e.g., Get-ChildItem, Select-String, Get-Content, Get-FileHash). "
+    "Do NOT use bash/Linux commands (ls, grep, cat, find, xxd, 2>/dev/null). "
+    "Use relative paths from the chosen root (e.g., .\\C\\Users\\... under root='source'), NEVER victim C:\\ paths."
+    if _PS_BIN
+    else f"Exact command formatted for {_ENV_SUMMARY.split('|')[1].strip()}. Use relative paths from the chosen root."
+)
 
 
 def _cap(raw: str | bytes | None, limit: int) -> tuple[str, bool]:
@@ -93,12 +105,10 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     if not decision:
         return declined_payload("Analyst declined terminal command.", decision.feedback)
 
-    # On Windows, invoke PowerShell directly (shell=False) so cmd.exe does not mangle quotes or pipes.
-    ps_bin = _get_windows_ps()
-    if ps_bin:
-        exec_args: str | list[str] = [ps_bin, "-NoProfile", "-NonInteractive", "-Command", command]
+    if _PS_BIN:
+        exec_args: str | list[str] = [_PS_BIN, "-NoProfile", "-NonInteractive", "-Command", command]
         use_shell = False
-        shell_name = Path(ps_bin).name
+        shell_name = Path(_PS_BIN).name
     else:
         exec_args = command
         use_shell = True
@@ -126,6 +136,7 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     stderr, err_trunc = _cap(proc.stderr, MAX_STDERR_CHARS)
     return {
         "shell": shell_name,
+        "cwd": str(cwd),
         "exit_code": proc.returncode,
         "stdout": stdout,
         "stderr": stderr,
@@ -152,14 +163,14 @@ REGISTER = [
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The exact command formatted for the shell shown in the tool description.",
+                            "description": _COMMAND_DESC,
                         },
                         "root": {
                             "type": "string",
                             "enum": ["output", "source"],
                             "description": (
-                                "Working directory: 'output' for the parsed output folder (default) "
-                                "or 'source' for the raw investigation directory."
+                                "Working directory: 'source' for raw collected evidence (where .\\C\\Users\\... lives) "
+                                "or 'output' for the parsed CSV folder (default)."
                             ),
                             "default": "output",
                         },
