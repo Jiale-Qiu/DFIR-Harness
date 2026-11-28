@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+import re
 import threading
 
 from rich import box
@@ -373,9 +374,43 @@ def confirm_action(
     )
 
 
+_STATUS_LABELS = {"findings": "Findings", "next step": "Next step", "uncertain": "Not verified yet"}
+_STATUS_LABEL_RE = re.compile(r"(findings|next step|uncertain)\s*[*_]*\s*[:\-]\s*", re.IGNORECASE)
+_STATUS_NOISE_RE = re.compile(r"findings log:\s*\d+\s*finding\(s\) recorded so far\.?", re.IGNORECASE)
+
+
+def _split_status_sections(status: str) -> list[tuple[str, str]]:
+    """Splits a Findings/Next step/Uncertain status blob into labeled sections."""
+    plain = status.replace("**", "").replace("__", "")
+    text = " ".join(_STATUS_NOISE_RE.sub("", plain).split())
+    matches = list(_STATUS_LABEL_RE.finditer(text))
+    if not matches:
+        return []
+
+    sections: list[tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[match.end() : end].strip(" .;-")
+        if body:
+            sections.append((_STATUS_LABELS[match.group(1).lower()], body))
+    return sections
+
+
 def confirm_checkpoint(status: str, round_no: int) -> ConfirmDecision:
     """HITL check-in: shows the model's findings + next step, then approves or redirects it."""
-    body = Markdown(status) if status.strip() else Text("[dim]Model returned no summary.[/dim]")
+    sections = _split_status_sections(status)
+    if sections:
+        blocks: list = []
+        for label, text in sections:
+            blocks.append(Text(label, style="bold cyan"))
+            blocks.append(Text(text))
+            blocks.append(Text(""))
+        body = Group(*blocks[:-1])
+    elif status.strip():
+        body = Markdown(status)
+    else:
+        body = Text("[dim]Model returned no summary.[/dim]")
+
     return _prompt_panel_choice(
         title=f"[bold blue]Analyst Check-in (round {round_no})[/bold blue]",
         body=body,

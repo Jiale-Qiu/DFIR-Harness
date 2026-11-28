@@ -44,9 +44,16 @@ The agent pauses every few tool rounds to report what it has established and the
 next step it plans to take, then waits for you (default: every 3 rounds):
 
 ```
-Findings: target.exe has an alternate data stream + a suspicious Run key value
-Next step: dump and hash the ADS payload, then check Autoruns for persistence
-
++- Analyst Check-in (round 3) ------------------------------------------------+
+| Findings                                                                    |
+| target.exe has an alternate data stream + a suspicious Run key value        |
+|                                                                             |
+| Next step                                                                   |
+| dump and hash the ADS payload, then check Autoruns for persistence          |
+|                                                                             |
+| Not verified yet                                                            |
+| payload not extracted; no reputation check                                  |
++-----------------------------------------------------------------------------+
 Continue? [Y]es / [n]o (or 'n <redirection>'): _
 ```
 

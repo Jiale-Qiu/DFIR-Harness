@@ -24,8 +24,10 @@ Pipeline (see `main.py`):
    `MAX_TOOL_ROUNDS` tool calls per turn; handles `/help`, `/pane`, `/autosql`, `/checkin`,
    reasoning level and thinking-mode slash commands. `_check_in` is a loop-level gate:
    every `state["checkin_every"]` tool rounds the model is asked for a Findings/Next
-   step/Uncertain summary (`_STATUS_REQUEST`, tools disabled), which the analyst approves
-   or redirects. Redirects reset the round budget; declines without feedback end the turn.
+   step/Uncertain summary (`_STATUS_REQUEST`, tools disabled, rendered only inside the
+   panel via `display=False`), which the analyst approves or redirects. `llm_ui` splits the
+   status into labeled sections. Redirects reset the round budget; declines without feedback
+   end the turn.
 6. `modules/llm_ui.py` — Rich rendering (streaming markdown/thinking), result tables, and
    the human-in-the-loop confirmation prompts (`confirm_sql`, `confirm_terminal`,
    `confirm_action`, `declined_payload`).

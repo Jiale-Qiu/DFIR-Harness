@@ -44,11 +44,30 @@ MAX_TOKENS = 16384
 
 _STATUS_REQUEST = (
     "Check in with the analyst now. Do not call tools.\n"
-    "Reply in at most 6 short lines, using exactly these labels:\n"
+    "Reply with at most 6 short lines, one label per line, using exactly these labels:\n"
     "Findings: what you have established so far, with the evidence behind each point.\n"
     "Next step: the single next action you plan to take, and why.\n"
     "Uncertain: anything still unverified or speculative."
 )
+
+
+class _NullRenderer:
+    """No-op stand-in for StreamRenderer when the text is displayed elsewhere (check-in panel)."""
+
+    def __enter__(self) -> "_NullRenderer":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def add_thinking(self, text: str) -> None:
+        pass
+
+    def add_answer(self, text: str) -> None:
+        pass
+
+    def set_status(self, text: str) -> None:
+        pass
 
 
 def _get_schemas(con, mounted_views: set[str]) -> dict[str, dict]:
@@ -233,6 +252,7 @@ def _stream_completion(
     state: dict,
     allow_tools: bool = True,
     reasoning_override: str | None = None,
+    display: bool = True,
 ) -> tuple[str, str, list[dict], str | None]:
     """Streams one LLM turn, returning (reply_text, reasoning_text, tool_calls_list, finish_reason)."""
     effective_reasoning = reasoning_override if reasoning_override is not None else state["reasoning"]
@@ -254,8 +274,10 @@ def _stream_completion(
     tool_calls_acc: dict[int, dict] = {}
     finish_reason = None
 
-    console.print()
-    with StreamRenderer(effective_reasoning, state["thinking_mode"]) as renderer:
+    if display:
+        console.print()
+    renderer = StreamRenderer(effective_reasoning, state["thinking_mode"]) if display else _NullRenderer()
+    with renderer:
         stream = client.chat.completions.create(**request_kwargs)
         for chunk in stream:
             if not chunk.choices:
@@ -290,7 +312,8 @@ def _stream_completion(
                         if tc.function.arguments:
                             entry["function"]["arguments"] += tc.function.arguments
 
-    print()
+    if display:
+        print()
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
     return "".join(answer_chunks), "".join(reasoning_chunks), tool_calls, finish_reason
 
@@ -567,15 +590,15 @@ def _check_in(
     logged = count_findings(findings_path(ctx))
     request = (
         f"{_STATUS_REQUEST}\n"
-        f"Findings log: {logged} finding(s) recorded so far. If this round established a MAJOR "
-        "conclusion that is not logged yet, call `record_finding` before continuing."
+        f"<harness_note>Findings log: {logged} finding(s) recorded so far. If this round established a "
+        "MAJOR conclusion that is not logged yet, call `record_finding` before continuing.</harness_note>"
     )
     base_len = len(messages)
     messages.append({"role": "user", "content": request})
     status = ""
     try:
         status, _reasoning, _tool_calls, _finish = _stream_completion(
-            client, model, messages, state, allow_tools=False
+            client, model, messages, state, allow_tools=False, display=False
         )
     except KeyboardInterrupt:
         console.print("\n[yellow][-] Status request interrupted.[/yellow]\n")
