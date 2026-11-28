@@ -7,6 +7,7 @@ from pathlib import Path
 
 import duckdb
 from openai import OpenAI
+from rich.markdown import Markdown
 from rich.table import Table
 
 from modules.tools.terminal import get_terminal_env_summary
@@ -30,6 +31,7 @@ from modules.pane_bridge import (
 )
 from modules.tools import TOOL_SCHEMAS, execute_tool, list_tools
 from modules.tools.duckdb_sql import execute_sql
+from modules.tools.findings import FINDINGS_FILENAME, count_findings, findings_path
 from modules import toolbox
 
 VALID_LEVELS = ("low", "medium", "high", "off")
@@ -212,7 +214,15 @@ def _build_system_prompt(
         "plan to the analyst. Keep each step small and independently verifiable, state ONE next action at a "
         "time, and never assume approval. If the analyst redirects you, drop the previous approach and follow "
         "their direction. Do not attempt to answer the whole question in one turn when evidence is still "
-        "incomplete — report what is verified, flag what is not, and stop."
+        "incomplete — report what is verified, flag what is not, and stop.\n"
+        f"11. Findings log (`record_finding` -> `{base_resolved / FINDINGS_FILENAME}`): every MAJOR conclusion "
+        "must be recorded once, in CER form — claim, direct evidence, reasoning. A major finding changes the "
+        "case narrative (malware execution, persistence, credential theft, lateral movement, exfiltration, "
+        "timeline anchors), NOT routine lookups, dead ends, or restatements of a tool's output. Evidence "
+        "entries must be direct and quotable (exact path, hash, timestamp, row value, raw output), and the "
+        "reasoning chain must state how each item proves the claim and why alternatives were rejected. "
+        "Record before reporting a conclusion to the analyst, and never claim something you have not logged "
+        "or explicitly marked unverified."
     )
 
 
@@ -496,6 +506,24 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         _handle_tools_command(arg, ctx, schemas, messages)
         return True
 
+    if cmd_lower == "/findings":
+        path = findings_path(ctx)
+        if not path.is_file():
+            console.print(
+                "[yellow][!] No findings recorded yet. The agent logs major findings with `record_finding`."
+                "[/yellow]\n"
+            )
+            return True
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[red][!] Could not read {path}: {exc}[/red]\n")
+            return True
+        console.print()
+        console.print(Markdown(text))
+        console.print(f"[dim]{path}[/dim]\n")
+        return True
+
     if cmd_lower == "/clear":
         del messages[1:]
         state["history"].clear()
@@ -531,12 +559,19 @@ def _check_in(
     client: OpenAI,
     model: str,
     messages: list[dict],
-    state: dict,
+    ctx: dict,
     round_idx: int,
 ) -> ConfirmDecision:
     """Pauses the turn so the analyst can approve the model's plan or redirect it."""
+    state = ctx["state"]
+    logged = count_findings(findings_path(ctx))
+    request = (
+        f"{_STATUS_REQUEST}\n"
+        f"Findings log: {logged} finding(s) recorded so far. If this round established a MAJOR "
+        "conclusion that is not logged yet, call `record_finding` before continuing."
+    )
     base_len = len(messages)
-    messages.append({"role": "user", "content": _STATUS_REQUEST})
+    messages.append({"role": "user", "content": request})
     status = ""
     try:
         status, _reasoning, _tool_calls, _finish = _stream_completion(
@@ -640,7 +675,7 @@ def _run_agent_turn(client: OpenAI, model: str, messages: list[dict], ctx: dict,
         round_idx += 1
 
         if _should_check_in(state, round_idx) and round_idx < MAX_TOOL_ROUNDS:
-            decision = _check_in(client, model, messages, state, round_idx)
+            decision = _check_in(client, model, messages, ctx, round_idx)
             if decision.approved:
                 continue
             if decision.feedback:

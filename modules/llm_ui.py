@@ -233,6 +233,7 @@ def print_help() -> None:
         ("/autosql [on|off]", "Toggle auto-accept for validated read-only SQL (default: off)"),
         ("/checkin <n|on|off>", "Pause every n tool rounds to approve or redirect the model's plan"),
         ("/schema", "List mounted DuckDB views, row counts, and columns"),
+        ("/findings", "Show the CER findings log written for this case"),
         ("/tools [list]", "List registered tool directories/files, pip packages, and AI tools"),
         ("/tools add <dir|file>", "Register a directory (added to PATH) or a single tool file (by path)"),
         ("/tools remove <dir|file|#>", "Unregister a tool directory or file by path or number"),

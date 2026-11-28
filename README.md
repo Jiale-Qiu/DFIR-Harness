@@ -54,6 +54,34 @@ Enter/y continues; `n <direction>` (or `n` plus the feedback prompt) redirects t
 instead, and a bare `n` stops the turn. Adjust the cadence in-session with
 `/checkin <rounds|on|off>` — `off` gives the model its full 10-round budget uninterrupted.
 
+Findings Log (CER)
+------------------
+Whenever the agent reaches a major conclusion it records it with the `record_finding` tool, which
+appends a CER entry to `output/<case>/findings.md` (claim, direct evidence, reasoning chain, plus
+alternatives, caveats and open verification steps). Routine lookups are not logged. The check-in
+prompt also reports how many findings are already recorded, so nothing major is left implicit.
+
+```
+## F-001 - target.exe executed the ADS payload
+
+- **Recorded (UTC):** 2026-11-27T02:40:11Z
+- **Confidence:** high
+- **Status:** agent-recorded, pending analyst verification
+
+**Direct evidence**
+1. `evtx view / Security.evtx` - EventId 4688: ProcessName=C:\Users\bob\Downloads\target.exe ...
+2. `mft view` - target.exe:payload ADS size=48KB, modified 2026-11-27T02:13:52Z
+
+**Reasoning chain**
+4688 shows the process start; the ADS predates it by 8s, so the stream is the executed payload.
+
+**Alternatives considered** ...   **Caveats / limits** ...   **Open verification steps** ...
+```
+
+Evidence items are deliberately strict — every one needs a `source` (artifact, view/query, or
+command) and a quotable `detail` (path, hash, timestamp, row value), so each claim can be traced
+back to raw data. Display the log any time with `/findings`.
+
 Template Tool:
 ```python
 def _my_handler(args: dict, ctx: dict) -> dict:

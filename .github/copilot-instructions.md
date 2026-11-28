@@ -36,7 +36,9 @@ Pipeline (see `main.py`):
    and reads its `REGISTER` list). Each module exports `REGISTER = [{"schema": ...,
    "handler": fn}]` where handlers take `(args, ctx)` and return a dict. Current tools:
    `query_duckdb`, `run_terminal`, `read_file`, `list_directory`, `calculate`,
-   `decode_base64`, `decode_hex`, `xor_decode`, `open_timeline_explorer`.
+   `decode_base64`, `decode_hex`, `xor_decode`, `open_timeline_explorer`, `record_finding`.
+   `modules/tools/findings.py` writes the CER findings log (`output/<case>/findings.md`)
+   and is also read by the `/findings` command and the check-in nudge.
 9. `modules/toolbox.py` — persistent registry of analyst-supplied tool directories *and*
    individual tool files (`~/.dfir-harness/toolbox.json`, override with `DFIR_TOOLBOX_CONFIG`)
    plus pip package discovery. Registered directories are prepended to PATH (process-wide and
@@ -114,6 +116,9 @@ against evidence to "test" a code change.
   read-only SQL validation in `modules/tools/duckdb_sql.py`, or the path confinement in
   `modules/tools/file_reader.py` / `_resolve_cwd` in `terminal.py`. New tools must keep
   the `REGISTER` schema/handler contract and return a dict.
+- **Preserve the CER contract in `modules/tools/findings.py`.** A finding needs a claim, at
+  least one direct evidence item (source + quotable detail), and a reasoning chain; keep
+  recording idempotent, appending (`F-###` ids) and never overwrite previous entries.
 - **Keep the check-in gate deterministic.** `_check_in` in `modules/llm_cli.py` enforces
   the analyst cadence from the agent loop; do not replace it with prompt-only instructions
   or let a tool decline skip it. Model output is advisory, the loop decides.
