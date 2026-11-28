@@ -15,7 +15,8 @@ DEFAULT_HEX_BYTES = 512
 MAX_HEX_BYTES_CAP = 2048
 MAX_LIST_ENTRIES = 100
 LARGE_CSV_WARN_BYTES = 256 * 1024  # 256 KB
-VALID_ROOTS = ("auto", "output", "source")
+VALID_ROOTS = ("auto", "scratch", "output", "source")
+SCRATCH_DIRNAME = "_scratch"
 
 
 def _resolve_confined(root_dir: Path, rel_path: str) -> tuple[Path | None, str | None]:
@@ -31,13 +32,18 @@ def _resolve_confined(root_dir: Path, rel_path: str) -> tuple[Path | None, str |
 def _resolve_target(
     ctx: dict, rel_path: str, root: str | None = None
 ) -> tuple[Path | None, str | None, Path | None, str | None, str | None]:
-    """Resolves a target path under 'output', 'source', or 'auto' (checks output then source)."""
+    """Resolves a target path under 'scratch', 'output', 'source', or 'auto'."""
     req = (root or "auto").strip().lower()
     if req not in VALID_ROOTS:
-        return None, None, None, None, f"Invalid root '{root}'. Use 'output', 'source', or 'auto'."
+        return None, None, None, None, f"Invalid root '{root}'. Use 'scratch', 'output', 'source', or 'auto'."
 
     base_out = Path(ctx["base_output"]).resolve()
     main_dir = Path(ctx["main_directory"]).resolve() if ctx.get("main_directory") else None
+
+    if req == "scratch":
+        scratch = base_out / SCRATCH_DIRNAME
+        target, err = _resolve_confined(scratch, rel_path)
+        return target, "scratch", scratch, None, err
 
     if req == "output":
         target, err = _resolve_confined(base_out, rel_path)
@@ -53,7 +59,7 @@ def _resolve_target(
     raw = (rel_path or ".").strip()
     if Path(raw).is_absolute():
         resolved = Path(raw).resolve()
-        for label, base in (("output", base_out), ("source", main_dir)):
+        for label, base in (("output", base_out), ("source", main_dir), ("scratch", base_out / SCRATCH_DIRNAME)):
             if base is not None and resolved.is_relative_to(base):
                 return resolved, label, base, None, None
         return None, None, None, None, "Access denied: path escapes the case directories."
@@ -220,7 +226,7 @@ def _read_file(args: dict, ctx: dict) -> dict:
 
                 line = raw_line.rstrip("\r\n")
                 if len(line) > MAX_SINGLE_LINE_CHARS:
-                    line = line[: MAX_SINGLE_LINE_CHARS - 1] + "… [line truncated]"
+                    line = line[: MAX_SINGLE_LINE_CHARS - 1] + "â€¦ [line truncated]"
 
                 formatted = f"{line_no}: {line}"
                 if char_count + len(formatted) + 1 > MAX_RETURN_CHARS:
@@ -250,7 +256,7 @@ def _read_file(args: dict, ctx: dict) -> dict:
         result["next_start_line"] = last_line_seen + 1
 
     csv_note = (
-        "Large CSV file — prefer DuckDB SQL if this artifact is mounted as a view."
+        "Large CSV file â€” prefer DuckDB SQL if this artifact is mounted as a view."
         if target.suffix.lower() == ".csv" and size_bytes > LARGE_CSV_WARN_BYTES
         else None
     )
@@ -316,10 +322,11 @@ REGISTER = [
                         },
                         "root": {
                             "type": "string",
-                            "enum": ["auto", "output", "source"],
+                            "enum": ["auto", "scratch", "output", "source"],
                             "description": (
                                 "Which directory tree to read from: 'source' for the selected investigation directory, "
-                                "'output' for the parsed output directory, or 'auto' (default) to check 'output' then 'source'."
+                                "'scratch' for your writable sandbox (_scratch), 'output' for the parsed output "
+                                "directory, or 'auto' (default) to check 'output' then 'source'."
                             ),
                             "default": "auto",
                         },
@@ -385,10 +392,11 @@ REGISTER = [
                         },
                         "root": {
                             "type": "string",
-                            "enum": ["auto", "output", "source"],
+                            "enum": ["auto", "scratch", "output", "source"],
                             "description": (
                                 "Which directory tree to list: 'source' for the selected investigation directory, "
-                                "'output' for the parsed output directory, or 'auto' (default)."
+                                "'scratch' for your writable sandbox (_scratch), 'output' for the parsed output "
+                                "directory, or 'auto' (default)."
                             ),
                             "default": "auto",
                         },

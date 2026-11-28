@@ -48,10 +48,18 @@ Pipeline (see `main.py`):
    change) so a shared folders like `C:\Program Files\7-Zip` exposes just the chosen exe.
    Installed packages are auto-detected via `importlib.metadata`. The CLI manages it through
    `/tools list|add|remove|pip install`, and the system prompt lists what is available.
+10. `modules/guard.py`, `modules/audit.py`, `modules/integrity.py` — safety layers. The guard
+    applies/restores a recursive deny ACE on the evidence root (kernel-enforced read-only) and
+    is re-checked after every `run_terminal`; the audit module appends hash-chained JSONL
+    (`output/<case>/audit.jsonl`) and verifies the chain; integrity hashes the evidence tree
+    (`evidence_manifest.json`) and provides a cheap path/size/mtime fingerprint used after each
+    command. `run_terminal` defaults to `root="scratch"` (`output/<case>/_scratch`), which is
+    cleaned on exit.
 
 `ctx` passed to handlers: `con` (DuckDB connection), `mounted_views`, `base_output`
 (parsed CSV root), `main_directory` (raw evidence root), `state` (reasoning, thinking
-mode, `auto_sql`, `history`, `pane_path`).
+mode, `auto_sql`, `checkin_every`, `guard_handle`, `evidence_baseline`, `history`,
+`pane_path`).
 
 Conventions worth preserving: camelCase for top-level pipeline functions
 (`scanDirectory`, `testFileMagic`, `run_triage`, `mount_views`) and snake_case for
@@ -81,6 +89,9 @@ py -3 main.py "C:\cases\case01" --clear        # wipe output/<case> first
 py -3 main.py "C:\cases\case01" --skip-parse   # reuse existing CSVs in output/<case>
 
 py -3 main.py --help
+
+# Tests (stdlib unittest; guard tests skip on non-Windows)
+py -3 -m unittest discover -s tests
 
 # Inside the investigation CLI: register extra CLI tools / pip packages (persisted)
 #   /tools add C:\tools\hayabusa            (directory -> added to PATH)
@@ -118,6 +129,10 @@ against evidence to "test" a code change.
   read-only SQL validation in `modules/tools/duckdb_sql.py`, or the path confinement in
   `modules/tools/file_reader.py` / `_resolve_cwd` in `terminal.py`. New tools must keep
   the `REGISTER` schema/handler contract and return a dict.
+- **Preserve the safety layers.** Never weaken, bypass or "simplify" `modules/guard.py`
+  (ACE apply/restore/status), the audit chain in `modules/audit.py`, or the fingerprint/manifest
+  checks in `modules/integrity.py`. `run_terminal` must keep auditing every outcome, re-checking
+  the guard, defaulting to the `scratch` root, and reporting `evidence_modified`.
 - **Preserve the CER contract in `modules/tools/findings.py`.** A finding needs a claim, at
   least one direct evidence item (source + quotable detail), and a reasoning chain; keep
   recording idempotent, appending (`F-###` ids) and never overwrite previous entries.

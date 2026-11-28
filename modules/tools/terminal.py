@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from modules import toolbox
+from modules import audit, guard, integrity, toolbox
 from modules.common import safe_int
-from modules.llm_ui import confirm_terminal, declined_payload
+from modules.llm_ui import confirm_terminal, console, declined_payload
 
 DEFAULT_TIMEOUT_SEC = 30
 MAX_TIMEOUT_SEC = 120
 MAX_STDOUT_CHARS = 10_000
 MAX_STDERR_CHARS = 4_000
+SCRATCH_DIRNAME = "_scratch"
 
 _PROBE_TOOLS = (
     "pwsh", "powershell", "certutil", "findstr", "where", "tar", "wevtutil", "reg",
@@ -77,9 +80,20 @@ def _cap(raw: str | bytes | None, limit: int) -> tuple[str, bool]:
     return text[:limit] + f"\n... [truncated {len(text) - limit:,} chars]", True
 
 
+def scratch_dir(ctx: dict) -> Path:
+    """Writable sandbox for extraction and scratch output (never evidence)."""
+    return Path(ctx["base_output"]).resolve() / SCRATCH_DIRNAME
+
+
 def _resolve_cwd(ctx: dict, root: str) -> tuple[Path | None, str | None]:
-    """Resolves the working directory for 'output' or 'source' roots."""
-    if root == "output":
+    """Resolves the working directory for 'scratch', 'output' or 'source' roots."""
+    if root == "scratch":
+        cwd = scratch_dir(ctx)
+        try:
+            cwd.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return None, f"Could not create scratch directory: {exc}"
+    elif root == "output":
         cwd = Path(ctx["base_output"]).resolve()
     elif root == "source":
         raw_main = ctx.get("main_directory")
@@ -87,11 +101,45 @@ def _resolve_cwd(ctx: dict, root: str) -> tuple[Path | None, str | None]:
             return None, "Source investigation directory is not configured."
         cwd = Path(raw_main).resolve()
     else:
-        return None, f"Invalid root '{root}'. Use 'output' or 'source'."
+        return None, f"Invalid root '{root}'. Use 'scratch', 'output', or 'source'."
 
     if not cwd.is_dir():
         return None, f"Working directory does not exist: {cwd}"
     return cwd, None
+
+
+def _recheck_guard(ctx: dict) -> None:
+    """Re-applies the deny ACE if it was removed, alerting the analyst and auditing it."""
+    handle = ctx["state"].get("guard_handle")
+    raw_main = ctx.get("main_directory")
+    if handle is None or not handle.applied or not raw_main:
+        return
+    source = Path(raw_main)
+    if guard.status(source, handle):
+        return
+
+    reapplied = guard.apply(source)
+    audit.append(ctx, "guard_tampered", tool="run_terminal", path=str(source), reapplied=reapplied.applied)
+    console.print(
+        "[red][!] Evidence guard was missing and has been re-applied — review the audit log.[/red]\n"
+        if reapplied.applied
+        else f"[red][!] Evidence guard is missing and could not be re-applied. {guard.restore_command(source)}[/red]\n"
+    )
+
+
+def _check_evidence_changes(ctx: dict) -> list[str]:
+    """Fast post-command check; returns changed evidence paths (empty when clean)."""
+    raw_main = ctx.get("main_directory")
+    baseline = ctx["state"].get("evidence_baseline")
+    if not raw_main or baseline is None:
+        return []
+    source = Path(raw_main).resolve()
+    if not source.is_dir():
+        return []
+    try:
+        return integrity.changed_since(source, baseline)
+    except OSError:
+        return []
 
 
 def _run_terminal(args: dict, ctx: dict) -> dict:
@@ -100,17 +148,22 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
         return {"error": "Empty command."}
 
     reason = str(args.get("reason") or "Run forensic CLI inspection").strip()
-    root = str(args.get("root") or "output").strip().lower()
+    root = str(args.get("root") or "scratch").strip().lower()
     timeout = max(5, min(MAX_TIMEOUT_SEC, safe_int(args.get("timeout"), DEFAULT_TIMEOUT_SEC)))
 
     cwd, err = _resolve_cwd(ctx, root)
     if err or cwd is None:
         return {"error": err or "Could not resolve working directory."}
 
+    audit.append(ctx, "proposed", tool="run_terminal", command=command, cwd=str(cwd), root=root)
+
     # Always require explicit analyst approval — intentionally ignores auto_sql or auto-accept flags.
     decision = confirm_terminal(reason=reason, command=command, cwd=str(cwd))
     if not decision:
+        audit.append(ctx, "declined", tool="run_terminal", command=command, cwd=str(cwd), root=root)
         return declined_payload("Analyst declined terminal command.", decision.feedback)
+
+    audit.append(ctx, "approved", tool="run_terminal", command=command, cwd=str(cwd), root=root)
 
     if _PS_BIN:
         exec_args: str | list[str] = [_PS_BIN, "-NoProfile", "-NonInteractive", "-Command", command]
@@ -136,13 +189,29 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
     except subprocess.TimeoutExpired as exc:
         out, _ = _cap(exc.stdout, MAX_STDOUT_CHARS)
         err_out, _ = _cap(exc.stderr, MAX_STDERR_CHARS)
+        audit.append(ctx, "timeout", tool="run_terminal", command=command, cwd=str(cwd), timeout=timeout)
+        _recheck_guard(ctx)
         return {"error": f"Command timed out after {timeout}s.", "stdout": out, "stderr": err_out}
     except OSError as exc:
+        audit.append(ctx, "error", tool="run_terminal", command=command, cwd=str(cwd), error=str(exc))
         return {"error": f"Failed to execute command: {exc}"}
 
     stdout, out_trunc = _cap(proc.stdout, MAX_STDOUT_CHARS)
     stderr, err_trunc = _cap(proc.stderr, MAX_STDERR_CHARS)
-    return {
+
+    audit.append(
+        ctx,
+        "executed",
+        tool="run_terminal",
+        command=command,
+        cwd=str(cwd),
+        root=root,
+        exit_code=proc.returncode,
+        stdout_sha256=hashlib.sha256((proc.stdout or "").encode("utf-8", "replace")).hexdigest(),
+    )
+    _recheck_guard(ctx)
+
+    result: dict = {
         "shell": shell_name,
         "cwd": str(cwd),
         "exit_code": proc.returncode,
@@ -150,6 +219,22 @@ def _run_terminal(args: dict, ctx: dict) -> dict:
         "stderr": stderr,
         "truncated": out_trunc or err_trunc,
     }
+
+    changed = _check_evidence_changes(ctx)
+    if changed:
+        listed = ", ".join(changed[:5]) + (f" (+{len(changed) - 5} more)" if len(changed) > 5 else "")
+        audit.append(ctx, "evidence_modified", tool="run_terminal", command=command, paths=changed[:50])
+        console.print(
+            f"[red][!] Evidence changed during that command: {listed}[/red]\n"
+            "[red]    Review the audit log and re-baseline with /integrity verify.[/red]\n"
+        )
+        result["evidence_modified"] = changed[:50]
+        result["warning"] = (
+            "Evidence files under root='source' changed while this command ran. Treat the affected "
+            "evidence as potentially contaminated and report it to the analyst."
+        )
+
+    return result
 
 
 REGISTER = [
@@ -164,9 +249,9 @@ REGISTER = [
                     "Use query_duckdb for mounted CSV views and read_file for simple text/hex slices, "
                     "but use run_terminal whenever CLI utilities are better suited—such as hashing files, "
                     "running strings/regex searches across artifacts, inspecting SQLite DBs/archives/PE headers, "
-                    "or parsing unmounted evidence. Keep commands read-only and output-bounded. If a command "
-                    "must create scratch files or extract archives, do it under $env:TEMP and delete everything "
-                    "you created before finishing."
+                    "or parsing unmounted evidence. Keep commands read-only and output-bounded. Write or extract "
+                    "files only under root='scratch' (default cwd), never inside the evidence tree, and delete "
+                    "what you created before finishing."
                 ),
                 "parameters": {
                     "type": "object",
@@ -177,12 +262,13 @@ REGISTER = [
                         },
                         "root": {
                             "type": "string",
-                            "enum": ["output", "source"],
+                            "enum": ["scratch", "output", "source"],
                             "description": (
-                                "Working directory: 'source' for raw collected evidence (where .\\C\\Users\\... lives) "
-                                "or 'output' for the parsed CSV folder (default)."
+                                "Working directory: 'scratch' (default) is a writable sandbox for extraction and "
+                                "any file you create; 'output' is the parsed CSV folder; 'source' is the raw "
+                                "collected evidence, which is OS-enforced read-only."
                             ),
-                            "default": "output",
+                            "default": "scratch",
                         },
                         "reason": {
                             "type": "string",

@@ -1,7 +1,9 @@
 """Interactive DFIR investigation CLI powered by OpenAI-compatible APIs and DuckDB."""
 
+import atexit
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -10,9 +12,8 @@ from openai import OpenAI
 from rich.markdown import Markdown
 from rich.table import Table
 
-from modules.tools.terminal import get_terminal_env_summary
-
-from modules.common import format_bytes
+from modules import audit, guard, integrity, toolbox
+from modules.common import format_bytes, safe_int
 from modules.llm_ui import (
     ConfirmDecision,
     StreamRenderer,
@@ -32,13 +33,14 @@ from modules.pane_bridge import (
 from modules.tools import TOOL_SCHEMAS, execute_tool, list_tools
 from modules.tools.duckdb_sql import execute_sql
 from modules.tools.findings import FINDINGS_FILENAME, count_findings, findings_path
-from modules import toolbox
+from modules.tools.terminal import get_terminal_env_summary, scratch_dir
 
 VALID_LEVELS = ("low", "medium", "high", "off")
 VALID_THINKING_MODES = ("collapse", "full", "off")
 DEFAULT_REASONING = "medium"
 DEFAULT_THINKING_MODE = "collapse"
 DEFAULT_CHECKIN_ROUNDS = 3
+AUDIT_TAIL = 40
 MAX_TOOL_ROUNDS = 10
 MAX_TOKENS = 16384
 
@@ -241,7 +243,12 @@ def _build_system_prompt(
         "entries must be direct and quotable (exact path, hash, timestamp, row value, raw output), and the "
         "reasoning chain must state how each item proves the claim and why alternatives were rejected. "
         "Record before reporting a conclusion to the analyst, and never claim something you have not logged "
-        "or explicitly marked unverified."
+        "or explicitly marked unverified.\n"
+        "12. Write protection (CRITICAL): the evidence tree (`root=\"source\"`) is enforced READ-ONLY by the "
+        "OS and any attempt to modify it fails. Write or extract files only under `root=\"scratch\"` (the "
+        "default working directory) and delete them when finished. Never try to change permissions, ACLs, "
+        "or the guard (`icacls`, `Set-Acl`, `takeown`); such attempts are reverted, alerted and audited as "
+        "guard tampering. If a tool needs a writable location, use scratch."
     )
 
 
@@ -406,6 +413,60 @@ def _handle_tools_command(arg: str, ctx: dict, schemas: dict, messages: list[dic
         _refresh_system_prompt(ctx, schemas, messages)
 
 
+def _scratch_stats(folder: Path) -> tuple[int, int]:
+    """Returns (file count, total bytes) for the scratch directory."""
+    files = size = 0
+    if not folder.is_dir():
+        return 0, 0
+    for item in folder.rglob("*"):
+        try:
+            if item.is_file():
+                files += 1
+                size += item.stat().st_size
+        except OSError:
+            continue
+    return files, size
+
+
+def _clean_scratch(folder: Path) -> tuple[int, int]:
+    """Deletes scratch contents, skipping locked entries. Returns (cleaned, skipped)."""
+    if not folder.is_dir():
+        return 0, 0
+    cleaned = skipped = 0
+    for item in sorted(folder.iterdir(), reverse=True):
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            cleaned += 1
+        except OSError:
+            skipped += 1
+    return cleaned, skipped
+
+
+def _take_snapshot(ctx: dict, source: Path) -> dict | None:
+    """Hashes the evidence tree with a progress bar; None when interrupted or unavailable."""
+    console.print(f"[cyan][*] Hashing evidence for the integrity baseline: {source}[/cyan]")
+    progress = {"name": ""}
+
+    def _progress(index: int, total: int, name: str) -> None:
+        progress["name"] = name
+        if index % 200 == 0 or index == total:
+            console.print(f"[dim]    {index}/{total} files (… {name})[/dim]", end="\r")
+
+    try:
+        manifest = integrity.snapshot(source, on_progress=_progress)
+    except OSError as exc:
+        console.print(f"\n[red][!] Could not hash evidence: {exc}[/red]\n")
+        return None
+    except KeyboardInterrupt:
+        console.print("\n[yellow][-] Baseline cancelled; continue with '/integrity snapshot' later.[/yellow]\n")
+        return None
+    console.print()
+    return manifest
+
+
 def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: list[dict]) -> bool:
     """Handles local CLI commands. Returns True if input was consumed locally."""
     cmd, _, arg = user_input.partition(" ")
@@ -545,6 +606,93 @@ def _handle_slash_command(user_input: str, ctx: dict, schemas: dict, messages: l
         console.print()
         console.print(Markdown(text))
         console.print(f"[dim]{path}[/dim]\n")
+        return True
+
+    if cmd_lower == "/guard":
+        source = ctx.get("main_directory")
+        if not source:
+            console.print("[yellow][!] No source directory for this case.[/yellow]\n")
+            return True
+        handle = state.get("guard_handle")
+        if handle is not None and guard.status(Path(source), handle):
+            console.print("[green][*] Evidence guard: ACTIVE (source write-protected)[/green]")
+        else:
+            console.print("[yellow][!] Evidence guard: INACTIVE (will be re-applied automatically)[/yellow]")
+        console.print(f"[dim]Source: {source}[/dim]")
+        console.print(f"[dim]Manual restore: {guard.restore_command(Path(source))}[/dim]\n")
+        return True
+
+    if cmd_lower == "/scratch":
+        folder = scratch_dir(ctx)
+        if arg.lower() == "clean":
+            files, size = _scratch_stats(folder)
+            cleaned, skipped = _clean_scratch(folder)
+            audit.append(ctx, "cleanup", tool="/scratch", files=cleaned, skipped=skipped)
+            console.print(
+                f"[cyan][*] Scratch cleaned: {cleaned} of {files} file(s) "
+                f"({format_bytes(size)}) removed"
+                + (f", {skipped} locked/skipped" if skipped else "")
+                + ".[/cyan]\n"
+            )
+            return True
+
+        files, size = _scratch_stats(folder)
+        console.print(f"[cyan][*] Scratch directory:[/cyan] {folder}")
+        console.print(f"[dim]    {files} file(s), {format_bytes(size)} — '/scratch clean' wipes it.[/dim]\n")
+        return True
+
+    if cmd_lower == "/audit":
+        if arg.lower() == "verify":
+            ok, message = audit.verify(ctx)
+            console.print(f"[{'green' if ok else 'red'}][{'+' if ok else '!'}] Audit chain: {message}"
+                          f"[/{'green' if ok else 'red'}]\n")
+            return True
+
+        limit = AUDIT_TAIL
+        if arg:
+            limit = max(1, min(500, safe_int(arg, limit)))
+        records = audit.read(ctx, limit)
+        if not records:
+            console.print("[yellow][!] No audit records yet.[/yellow]\n")
+            return True
+
+        table = Table(title=f"Audit Log (last {len(records)})")
+        table.add_column("Time", style="dim", no_wrap=True)
+        table.add_column("Event", style="bold cyan")
+        table.add_column("Detail", overflow="fold")
+        for item in records:
+            detail = item.get("command") or item.get("finding_id") or item.get("path") or item.get("files") or ""
+            if item.get("exit_code") is not None:
+                detail = f"{detail}  [dim](exit {item['exit_code']})[/dim]"
+            table.add_row(str(item.get("ts", ""))[11:19], str(item.get("event", "")), str(detail))
+        console.print(table)
+        console.print(f"[dim]{audit.audit_path(ctx)}[/dim]\n")
+        return True
+
+    if cmd_lower == "/integrity":
+        source = ctx.get("main_directory")
+        if not source:
+            console.print("[yellow][!] No source directory for this case.[/yellow]\n")
+            return True
+        source_path = Path(source).resolve()
+
+        if arg.lower() == "snapshot":
+            manifest = _take_snapshot(ctx, source_path)
+            if manifest is None:
+                return True
+            save_path = integrity.save(ctx, manifest, source_path)
+            state["evidence_baseline"] = integrity.fingerprint(source_path)
+            console.print(f"[green][+] Baseline written: {save_path} ({len(manifest)} files)[/green]\n")
+            return True
+
+        manifest, _ = integrity.load(ctx)
+        if not manifest:
+            console.print("[yellow][!] No baseline yet. Run '/integrity snapshot' first.[/yellow]\n")
+            return True
+        result = integrity.diff(source_path, manifest)
+        changed = result["added"] or result["removed"] or result["modified"]
+        console.print(f"[{'red' if changed else 'green'}][{'!' if changed else '+'}] {integrity.summarize(result)}"
+                      f"[/{'red' if changed else 'green'}]\n")
         return True
 
     if cmd_lower == "/clear":
@@ -711,7 +859,71 @@ def _run_agent_turn(client: OpenAI, model: str, messages: list[dict], ctx: dict,
     console.print(f"[yellow][!] Reached {MAX_TOOL_ROUNDS} consecutive tool rounds. Stopping turn.[/yellow]\n")
 
 
-def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: Path | None = None) -> None:
+def _setup_safety(ctx: dict) -> None:
+    """Applies the evidence guard and baselines the evidence tree before the model runs."""
+    state = ctx["state"]
+    state.setdefault("guard_handle", None)
+    state.setdefault("evidence_baseline", None)
+
+    source = ctx.get("main_directory")
+    if source is None:
+        return
+    source_path = Path(source).resolve()
+
+    if guard.is_elevated():
+        console.print("[yellow][!] Running elevated: ACL-based protection does NOT stop an admin token.[/yellow]")
+
+    handle = guard.apply(source_path)
+    state["guard_handle"] = handle
+    if handle.applied:
+        atexit.register(guard.restore, handle)
+        console.print(f"[green][+] {handle.reason}: {source_path}[/green]")
+        audit.append(ctx, "guard_applied", tool="startup", path=str(source_path))
+    else:
+        console.print(f"[yellow][!] Evidence guard not applied: {handle.reason}[/yellow]")
+        console.print(f"[dim]    Manual command: {guard.restore_command(source_path)}[/dim]")
+
+    manifest = _take_snapshot(ctx, source_path)
+    if manifest is not None:
+        integrity.save(ctx, manifest, source_path)
+        state["evidence_baseline"] = integrity.fingerprint(source_path)
+        console.print(f"[green][+] Evidence baseline: {len(manifest)} file(s) hashed.[/green]\n")
+    else:
+        state["evidence_baseline"] = integrity.fingerprint(source_path)
+        console.print("[yellow][!] Continuing without a hash baseline (fingerprint guard active).[/yellow]\n")
+
+
+def _shutdown_safety(ctx: dict) -> None:
+    """Restores the evidence guard and cleans the scratch directory."""
+    state = ctx["state"]
+    handle = state.get("guard_handle")
+    if handle is not None and handle.applied:
+        if guard.restore(handle):
+            audit.append(ctx, "guard_restored", tool="shutdown", path=handle.path)
+        else:
+            console.print(
+                f"[yellow][!] Could not remove the evidence deny ACE. Run: "
+                f"{guard.restore_command(Path(handle.path))}[/yellow]"
+            )
+
+    folder = Path(ctx["base_output"]) / "_scratch"
+    files, size = _scratch_stats(folder)
+    if files:
+        cleaned, skipped = _clean_scratch(folder)
+        audit.append(ctx, "cleanup", tool="shutdown", files=cleaned, skipped=skipped)
+        console.print(
+            f"[dim][*] Scratch cleaned: {cleaned} file(s), {format_bytes(size)}"
+            + (f", {skipped} locked/skipped" if skipped else "")
+            + ".[/dim]"
+        )
+
+
+def start_cli(
+    con,
+    mounted_views: set[str],
+    base_output: Path,
+    main_directory: Path | None = None,
+) -> None:
     """Interactive DFIR investigation CLI with DuckDB schema grounding and HITL tool execution."""
     api_key = os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("LLM_MODEL")
@@ -740,10 +952,13 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
             "thinking_mode": DEFAULT_THINKING_MODE,
             "auto_sql": False,
             "checkin_every": DEFAULT_CHECKIN_ROUNDS,
+            "guard_handle": None,
+            "evidence_baseline": None,
             "history": [],
             "pane_path": pane_path,
         },
     }
+    _setup_safety(ctx)
     messages = [{"role": "system", "content": _build_system_prompt(schemas, base_path, main_path)}]
 
     console.print("\n[bold cyan]=== LLM Investigation CLI ===[/bold cyan]")
@@ -787,3 +1002,4 @@ def start_cli(con, mounted_views: set[str], base_output: Path, main_directory: P
                 del messages[turn_start_idx:]
     finally:
         close_result_pane(pane_path)
+        _shutdown_safety(ctx)

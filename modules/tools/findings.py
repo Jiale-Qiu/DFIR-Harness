@@ -7,9 +7,16 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from rich.console import Console
+
+from modules import audit
+
+console = Console(highlight=False)
+
 FINDINGS_FILENAME = "findings.md"
 VALID_CONFIDENCE = ("high", "medium", "low")
 MAX_EVIDENCE_ITEMS = 12
+_CLAIM_PREVIEW_CHARS = 100
 
 _HEADER = (
     "# Case Findings Log\n"
@@ -95,6 +102,12 @@ def _format_block(
     return "\n".join(lines) + "\n"
 
 
+def _reject(message: str) -> dict:
+    """Reports a rejected finding to the analyst and returns the error payload for the model."""
+    console.print(f"[yellow][!] Finding not recorded: {message}[/yellow]")
+    return {"error": message}
+
+
 def _handle_record_finding(args: dict, ctx: dict) -> dict:
     claim = _one_line(args.get("claim"))
     reasoning = str(args.get("reasoning") or "").strip()
@@ -104,21 +117,21 @@ def _handle_record_finding(args: dict, ctx: dict) -> dict:
     next_steps = str(args.get("next_steps") or "").strip()
 
     if not claim:
-        return {"error": "claim is required: one falsifiable sentence."}
+        return _reject("claim is required: one falsifiable sentence.")
     if confidence not in VALID_CONFIDENCE:
-        return {"error": f"confidence must be one of: {', '.join(VALID_CONFIDENCE)}."}
+        return _reject(f"confidence must be one of: {', '.join(VALID_CONFIDENCE)}.")
     if not reasoning:
-        return {"error": "reasoning is required: explain how the evidence supports the claim."}
+        return _reject("reasoning is required: explain how the evidence supports the claim.")
 
     evidence, evidence_error = _parse_evidence(args.get("evidence"))
     if evidence_error:
-        return {"error": evidence_error}
+        return _reject(evidence_error)
 
     path = findings_path(ctx)
     try:
         existing = path.read_text(encoding="utf-8") if path.is_file() else _HEADER
     except OSError as exc:
-        return {"error": f"Could not read findings log: {exc}"}
+        return _reject(f"Could not read findings log: {exc}")
 
     finding_id = f"F-{_next_index(existing):03d}"
     block = _format_block(
@@ -140,11 +153,19 @@ def _handle_record_finding(args: dict, ctx: dict) -> dict:
         tmp_path.write_text(existing.rstrip() + "\n\n" + block, encoding="utf-8")
         os.replace(tmp_path, path)
     except OSError as exc:
-        return {"error": f"Could not write findings log: {exc}"}
+        return _reject(f"Could not write findings log: {exc}")
     finally:
         tmp_path.unlink(missing_ok=True)
 
     total = len(re.findall(r"^## F-\d+", existing, re.MULTILINE)) + 1
+    audit.append(ctx, "finding", tool="record_finding", finding_id=finding_id, confidence=confidence, file=str(path))
+    preview = claim if len(claim) <= _CLAIM_PREVIEW_CHARS else claim[: _CLAIM_PREVIEW_CHARS - 1] + "…"
+    console.print(
+        f"[green][+] Finding {finding_id} recorded[/green] [dim]({confidence}, "
+        f"{len(evidence)} evidence item(s), {total} total)[/dim]\n"
+        f"    [bold]{preview}[/bold]\n"
+        f"    [dim]{path}[/dim]"
+    )
     return {
         "status": "recorded",
         "finding_id": finding_id,

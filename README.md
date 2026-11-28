@@ -87,7 +87,42 @@ prompt also reports how many findings are already recorded, so nothing major is 
 
 Evidence items are deliberately strict — every one needs a `source` (artifact, view/query, or
 command) and a quotable `detail` (path, hash, timestamp, row value), so each claim can be traced
-back to raw data. Display the log any time with `/findings`.
+back to raw data. Every write prints a transcript confirmation (id, confidence, evidence count,
+total, path) or a rejection reason, and `/findings` displays the whole log any time.
+
+Safety Layers
+-------------
+The harness assumes it runs inside a VM; on top of that, the evidence tree and the model's
+side effects are guarded:
+
+- **Kernel write protection** — on start the evidence directory gets a deny ACE
+  (`icacls … /deny "<user>:(OI)(CI)(DE,WD,AD,WEA,WA)"`), so any create/modify/rename/delete
+  beneath it fails at the OS level, regardless of the command. Reads are unaffected. The ACE is
+  removed on exit (also via a crash handler). There is no switch to disable it; `/guard` shows
+  the state plus the manual `icacls` restore command (needed only if a crash leaves it behind).
+- **Tamper detection** — after every `run_terminal`, the ACE is re-checked; if it was removed it
+  is re-applied and audited as `guard_tampered`. A cheap path/size/mtime fingerprint of the
+  evidence tree runs too, so any change (including one made after removing the ACE in the same
+  command) is flagged, audited as `evidence_modified`, and reported to the model.
+- **Scratch confinement** — `run_terminal` defaults to `root="scratch"`
+  (`output/<case>/_scratch`), so relative-path writes land outside the case and evidence.
+  `/scratch` shows usage, `/scratch clean` wipes it; it is cleaned automatically on exit.
+- **Tamper-evident audit log** — `output/<case>/audit.jsonl`, hash-chained (`prev` + `hash`):
+  proposed / approved / declined / executed (+ exit code and stdout hash) / timeout / error /
+  evidence_modified / guard_applied / guard_tampered / guard_restored / finding / cleanup.
+  `/audit [n]` shows recent events, `/audit verify` detects edits, deletions or reordering.
+- **Evidence integrity baseline** — sha256 manifest of the evidence tree at start
+  (`output/<case>/evidence_manifest.json`); `/integrity verify` reports added/removed/modified and
+  `/integrity snapshot` re-baselines (e.g. after an accepted, documented change). The baseline
+  itself always runs.
+
+Limits (deliberate): the model runs as your account, so it *can* deliberately remove the deny
+ACE — that is re-applied, alerted and audited, and evidence changes are still detected; elevated
+processes bypass ACLs; FAT/exFAT and network shares cannot be guarded (warned at start); writes
+to unrelated system paths are audited but not blocked. The VM remains the real containment
+boundary for detonating malware.
+
+Tests: `python -m unittest discover -s tests` (guard, audit, integrity).
 
 Template Tool:
 ```python
